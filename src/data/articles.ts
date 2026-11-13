@@ -4,9 +4,10 @@ import { enPassages } from './en-library';
 export const difficulties = ['beginner', 'intermediate', 'advanced'] as const;
 export type Difficulty = typeof difficulties[number];
 export type Language = 'zh' | 'en';
-export type Article = { id: string; language: Language; difficulty: Difficulty; title: string; content: string };
+export type ArticleSource = { name: string; url: string; license: 'public-domain' };
+export type Passage = { title: string; content: string; author: string; theme: string; source: ArticleSource };
+export type Article = Passage & { id: string; language: Language; difficulty: Difficulty };
 
-type Passage = { title: string; content: string };
 function createArticles(language: Language, difficulty: Difficulty, passages: Passage[]): Article[] {
   return passages.map((passage, index) => ({ ...passage, id: `${language}-${difficulty}-${index + 1}`, language, difficulty }));
 }

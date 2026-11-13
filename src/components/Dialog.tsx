@@ -1,10 +1,18 @@
-import { useEffect, useRef, type ReactNode } from 'react';
+import { useEffect, useId, useRef, useState, type ReactNode } from 'react';
+import { createPortal } from 'react-dom';
 import { X } from '@phosphor-icons/react/X';
 
 export function Dialog({ title, onClose, children }: { title: string; onClose: () => void; children: ReactNode }) {
   const dialog = useRef<HTMLDivElement>(null);
+  const titleId = useId();
+  const [portalTarget, setPortalTarget] = useState<Element>(() => document.fullscreenElement ?? document.body);
   const closeRef = useRef(onClose);
   closeRef.current = onClose;
+  useEffect(() => {
+    const updateTarget = () => setPortalTarget(document.fullscreenElement ?? document.body);
+    document.addEventListener('fullscreenchange', updateTarget);
+    return () => document.removeEventListener('fullscreenchange', updateTarget);
+  }, []);
   useEffect(() => {
     const previous = document.activeElement as HTMLElement | null;
     const element = dialog.current;
@@ -21,11 +29,11 @@ export function Dialog({ title, onClose, children }: { title: string; onClose: (
     };
     document.addEventListener('keydown', onKeyDown);
     return () => { document.removeEventListener('keydown', onKeyDown); previous?.focus(); };
-  }, []);
-  return <div className="dialog-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
-    <div ref={dialog} className="dialog" role="dialog" aria-modal="true" aria-labelledby="dialog-title">
-      <div className="dialog-heading"><h2 id="dialog-title">{title}</h2><button className="icon-button" aria-label="关闭" onClick={onClose}><X size={22} /></button></div>
+  }, [portalTarget]);
+  return createPortal(<div className="dialog-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
+    <div ref={dialog} className="dialog" role="dialog" aria-modal="true" aria-labelledby={titleId}>
+      <div className="dialog-heading"><h2 id={titleId}>{title}</h2><button className="icon-button" aria-label="关闭" onClick={onClose}><X size={22} /></button></div>
       {children}
     </div>
-  </div>;
+  </div>, portalTarget);
 }

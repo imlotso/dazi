@@ -1,0 +1,230 @@
+// @vitest-environment jsdom
+import { act, cleanup, renderHook, waitFor } from '@testing-library/react';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { useWorkspace } from '../src/hooks/useWorkspace';
+import {
+  chunkWorkspaceItems, deleteWorkspaceValue, isWorkspaceDraftDeleted, mergeWorkspaceItems, newerWorkspaceItems, putWorkspaceValue, readWorkspace,
+} from '../src/lib/workspace';
+import type { SavedPractice, WorkspaceItem } from '../src/lib/models';
+
+const favorite = (id: string, updatedAt = Date.now()): WorkspaceItem =>
+  ({ kind: 'favorite', id, updatedAt, value: { articleId: id } });
+const response = (items: WorkspaceItem[]) =>
+  new Response(JSON.stringify({ items, serverTime: Date.now() }), { headers: { 'Content-Type': 'application/json' } });
+const draft: SavedPractice = {
+  id: 'draft-1', article: { id: 'private-1', title: '练习', text: '你好', language: 'zh', difficulty: 'beginner', custom: true },
+  typed: '你', elapsedMs: 3000, backspaces: 0, duration: 60, mode: 'timed', strict: false, offset: 0,
+  recordId: 'record-1', offline: true, ownerId: 'alice', savedAt: 3,
+};
+
+beforeEach(() => localStorage.clear());
+afterEach(() => { cleanup(); vi.unstubAllGlobals(); vi.restoreAllMocks(); });
+
+describe('local workspace', () => {
+  it('retains tombstones, keeps newer edits and lets the incoming server item win ties', () => {
+    const tombstone: WorkspaceItem = { kind: 'favorite', id: 'deleted', updatedAt: 5, deleted: true };
+    expect(mergeWorkspaceItems([tombstone, favorite('edited', 8), favorite('tie', 3)], [
+      favorite('deleted', 4), favorite('edited', 6), { kind: 'favorite', id: 'tie', updatedAt: 3, deleted: true },
+    ])).toEqual([tombstone, favorite('edited', 8), { kind: 'favorite', id: 'tie', updatedAt: 3, deleted: true }]);
+  });
+
+  it('isolates persisted data across owners and serializes concurrent local edits', async () => {
+    const articleId = 'zh-beginner-1';
+    await Promise.all([
+      putWorkspaceValue(null, 'favorite', articleId, { articleId }),
+      putWorkspaceValue('alice', 'favorite', articleId, { articleId }),
+      deleteWorkspaceValue('alice', 'favorite', articleId),
+    ]);
+    expect(await readWorkspace('alice')).toEqual([expect.objectContaining({ id: articleId, deleted: true })]);
+    expect(await readWorkspace('bob')).toEqual([]);
+    expect(await readWorkspace(null)).toEqual([expect.objectContaining({ value: { articleId } })]);
+  });
+
+  it('merges a draft deletion over newer live progress and still uploads an older local deletion', () => {
+    const live: WorkspaceItem = { kind: 'draft', id: draft.id, updatedAt: 3, value: draft };
+    const tombstone: WorkspaceItem = { kind: 'draft', id: draft.id, updatedAt: 2, deleted: true };
+    expect(mergeWorkspaceItems([live], [tombstone])).toEqual([tombstone]);
+    expect(mergeWorkspaceItems([tombstone], [live])).toEqual([tombstone]);
+    expect(newerWorkspaceItems([tombstone], [live])).toEqual([tombstone]);
+    expect(newerWorkspaceItems([live], [tombstone])).toEqual([]);
+  });
+
+  it('refuses to write a deleted draft ID but accepts a new draft ID', async () => {
+    await deleteWorkspaceValue('alice', 'draft', draft.id);
+    await expect(putWorkspaceValue('alice', 'draft', draft.id, draft)).rejects.toMatchObject({ name: 'DraftDeletedError', id: draft.id });
+    const fresh = { ...draft, id: 'draft-2' };
+    await putWorkspaceValue('alice', 'draft', fresh.id, fresh);
+    expect((await readWorkspace('alice')).find((item) => item.id === fresh.id)?.value).toEqual(fresh);
+    expect(isWorkspaceDraftDeleted('alice', draft.id)).toBe(true);
+    expect(isWorkspaceDraftDeleted('bob', draft.id)).toBe(false);
+  });
+
+  it('preserves saved state when persistence fails', async () => {
+    await putWorkspaceValue('alice', 'favorite', 'saved', { articleId: 'saved' });
+    const error = new DOMException('Storage full', 'QuotaExceededError');
+    vi.spyOn(Storage.prototype, 'setItem').mockImplementationOnce(() => { throw error; });
+    await expect(putWorkspaceValue('alice', 'favorite', 'unsaved', { articleId: 'unsaved' })).rejects.toThrow('Storage full');
+    expect(await readWorkspace('alice')).toEqual([expect.objectContaining({ id: 'saved' })]);
+  });
+
+  it('chunks by both the serialized UTF-8 size and the item count', () => {
+    const small = Array.from({ length: 110 }, (_, index) => favorite(String(index)));
+    expect(chunkWorkspaceItems(small).map((chunk) => chunk.length)).toEqual([100, 10]);
+    const large = Array.from({ length: 75 }, (_, index) => ({
+      ...favorite(String(index)), value: { text: '字'.repeat(20_000) },
+    }));
+    const chunks = chunkWorkspaceItems(large);
+    expect(chunks).toHaveLength(2);
+    expect(chunks.flat()).toEqual(large);
+    for (const items of chunks) expect(new TextEncoder().encode(JSON.stringify({ items })).byteLength).toBeLessThanOrEqual(3 * 1024 * 1024);
+  });
+});
+
+describe('workspace sync', () => {
+  it('uploads a local deletion committed while the initial server request is pending', async () => {
+    let release!: (result: Response) => void;
+    const fetcher = vi.fn<typeof fetch>()
+      .mockImplementationOnce(() => new Promise((resolve) => { release = resolve; }))
+      .mockImplementation(async (_url, options) => response(JSON.parse(String(options?.body)).items));
+    vi.stubGlobal('fetch', fetcher);
+    const initial = favorite('same');
+    await putWorkspaceValue('alice', 'favorite', 'same', { articleId: 'same' });
+    const { result } = renderHook(() => useWorkspace('alice'));
+    await waitFor(() => expect(fetcher).toHaveBeenCalledTimes(1));
+    await act(() => result.current.remove('favorite', 'same'));
+    await act(async () => { release(response([initial])); });
+    await waitFor(() => expect(result.current.syncState).toBe('synced'));
+    expect(result.current.favorites).toEqual([]);
+    expect(JSON.parse(String(fetcher.mock.calls[1][1]?.body)).items).toEqual([expect.objectContaining({ id: 'same', deleted: true })]);
+  });
+
+  it('exposes deleted draft IDs from persisted tombstones without returning them as active drafts', async () => {
+    await deleteWorkspaceValue(null, 'draft', 'deleted-draft');
+    const { result } = renderHook(() => useWorkspace(null));
+    await waitFor(() => expect(result.current.ready).toBe(true));
+    expect(result.current.deletedDraftIds).toEqual(['deleted-draft']);
+    expect(result.current.drafts).toEqual([]);
+  });
+
+  it('hides the previous owner immediately and discards an old response after switching', async () => {
+    let release!: (result: Response) => void;
+    const fetcher = vi.fn<typeof fetch>()
+      .mockImplementationOnce(() => new Promise((resolve) => { release = resolve; }))
+      .mockImplementation(async () => response([]));
+    vi.stubGlobal('fetch', fetcher);
+    await putWorkspaceValue('alice', 'favorite', 'alice-local', { articleId: 'alice-local' });
+    const { result, rerender } = renderHook(({ owner }) => useWorkspace(owner), { initialProps: { owner: 'alice' } });
+    await waitFor(() => expect(result.current.favorites).toEqual(['alice-local']));
+    await waitFor(() => expect(fetcher).toHaveBeenCalledTimes(1));
+    rerender({ owner: 'bob' });
+    expect(result.current.favorites).toEqual([]);
+    await act(async () => { release(response([favorite('alice-cloud')])); });
+    await waitFor(() => expect(result.current.syncState).toBe('synced'));
+    expect(result.current.favorites).toEqual([]);
+    expect(await readWorkspace('bob')).toEqual([]);
+    expect((await readWorkspace('alice')).map((item) => item.id)).toEqual(['alice-local']);
+    expect(fetcher.mock.calls.every(([url]) => url === '/api/workspace')).toBe(true);
+  });
+
+  it('merges simultaneous preference changes against the latest saved settings', async () => {
+    localStorage.setItem('cloudtyping.theme.v1', 'dark');
+    const { result } = renderHook(() => useWorkspace(null));
+    await waitFor(() => expect(result.current.ready).toBe(true));
+    await act(async () => { await Promise.all([
+      result.current.updateSettings({ minutes: 12 }),
+      result.current.updateSettings({ strict: true }),
+    ]); });
+    await waitFor(() => expect(result.current.settings).toMatchObject({ minutes: 12, strict: true, theme: 'dark' }));
+  });
+
+  it('keeps the local workspace usable on malformed responses and supports manual retry', async () => {
+    const fetcher = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ serverTime: Date.now() })))
+      .mockImplementation(async (_url, options) => response(options?.body ? JSON.parse(String(options.body)).items : []));
+    vi.stubGlobal('fetch', fetcher);
+    await putWorkspaceValue('alice', 'favorite', 'saved', { articleId: 'saved' });
+    const { result } = renderHook(() => useWorkspace('alice'));
+    await waitFor(() => expect(result.current.syncState).toBe('error'));
+    expect(result.current.ready).toBe(true);
+    expect(result.current.cloudLoaded).toBe(false);
+    expect(result.current.favorites).toEqual(['saved']);
+    await act(() => result.current.sync());
+    expect(result.current.syncState).toBe('synced');
+    expect(result.current.cloudLoaded).toBe(true);
+    expect(result.current.favorites).toEqual(['saved']);
+  });
+
+  it('rejects malformed settings in a remote item without replacing usable local settings', async () => {
+    const malformed = {
+      kind: 'settings', id: 'preferences', updatedAt: Date.now(),
+      value: { minutes: 5, theme: 'dark', lineHeight: 'invalid' },
+    } satisfies WorkspaceItem;
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async () => response([malformed])));
+    const { result } = renderHook(() => useWorkspace('alice'));
+    await waitFor(() => expect(result.current.syncState).toBe('error'));
+    expect(result.current.settings).toMatchObject({ lineHeight: 1.6, theme: 'light' });
+    expect(await readWorkspace('alice')).toEqual([]);
+  });
+
+  it('syncs valid changes alongside a rejected item and keeps the rejected item available locally', async () => {
+    const serverItems: WorkspaceItem[] = [];
+    const posts: WorkspaceItem[][] = [];
+    let acceptsRejected = false;
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (_url, options) => {
+      if (!options?.body) return response(serverItems);
+      const { items } = JSON.parse(String(options.body)) as { items: WorkspaceItem[] };
+      posts.push(items);
+      if (!acceptsRejected && items.some((item) => item.id === 'rejected')) {
+        return new Response(JSON.stringify({ error: '同步数据无效' }), { status: 400 });
+      }
+      serverItems.push(...items);
+      return response(serverItems);
+    }));
+    await putWorkspaceValue('alice', 'favorite', 'saved', { articleId: 'saved' });
+    await putWorkspaceValue('alice', 'favorite', 'rejected', { articleId: 'rejected' });
+    const { result } = renderHook(() => useWorkspace('alice'));
+    await waitFor(() => expect(result.current.syncState).toBe('error'));
+    expect(result.current.favorites.sort()).toEqual(['rejected', 'saved']);
+    expect(result.current.cloudLoaded).toBe(true);
+    expect(serverItems.map((item) => item.id)).toEqual(['saved']);
+    expect(posts.map((items) => items.length)).toEqual([2, 1, 1]);
+    acceptsRejected = true;
+    await act(() => result.current.sync());
+    expect(result.current.syncState).toBe('synced');
+    expect(serverItems.map((item) => item.id)).toEqual(['saved', 'rejected']);
+  });
+
+  it('does not quarantine or subdivide a batch after a temporary HTTP failure', async () => {
+    const posts: WorkspaceItem[][] = [];
+    let healthy = false;
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockImplementation(async (_url, options) => {
+      if (!options?.body) return response([]);
+      const { items } = JSON.parse(String(options.body)) as { items: WorkspaceItem[] };
+      posts.push(items);
+      return healthy ? response(items) : new Response(JSON.stringify({ error: '服务暂不可用' }), { status: 503 });
+    }));
+    for (const id of ['first', 'second']) await putWorkspaceValue('alice', 'favorite', id, { articleId: id });
+    const { result } = renderHook(() => useWorkspace('alice'));
+    await waitFor(() => expect(result.current.syncState).toBe('error'));
+    expect(posts.map((items) => items.length)).toEqual([2]);
+    healthy = true;
+    await act(() => result.current.sync());
+    expect(result.current.syncState).toBe('synced');
+    expect(posts.map((items) => items.length)).toEqual([2, 2]);
+  });
+
+  it('uploads unrelated items when an oversized record cannot fit in a single batch', async () => {
+    const fetcher = vi.fn<typeof fetch>().mockImplementation(async (_url, options) =>
+      response(options?.body ? JSON.parse(String(options.body)).items : []));
+    vi.stubGlobal('fetch', fetcher);
+    await putWorkspaceValue('alice', 'record', 'oversized', {
+      language: 'zh', difficulty: 'beginner', duration: 60, accuracy: 0, speed: 0, finishedAt: Date.now(),
+      typed: '字'.repeat(1_050_000),
+    });
+    await putWorkspaceValue('alice', 'favorite', 'saved', { articleId: 'saved' });
+    const { result } = renderHook(() => useWorkspace('alice'));
+    await waitFor(() => expect(result.current.syncState).toBe('error'));
+    expect(result.current.records).toHaveLength(1);
+    expect(JSON.parse(String(fetcher.mock.calls[1]?.[1]?.body)).items).toEqual([expect.objectContaining({ id: 'saved' })]);
+  });
+});

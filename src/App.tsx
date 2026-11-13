@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent } from 'react';
+import { ArrowCounterClockwise } from '@phosphor-icons/react/ArrowCounterClockwise';
+import { ArrowRight } from '@phosphor-icons/react/ArrowRight';
 import { BookOpen } from '@phosphor-icons/react/BookOpen';
 import { CaretDown } from '@phosphor-icons/react/CaretDown';
 import { CheckCircle } from '@phosphor-icons/react/CheckCircle';
 import { Clock } from '@phosphor-icons/react/Clock';
 import { Cloud } from '@phosphor-icons/react/Cloud';
-import { Crown } from '@phosphor-icons/react/Crown';
 import { Crosshair } from '@phosphor-icons/react/Crosshair';
 import { Keyboard } from '@phosphor-icons/react/Keyboard';
 import { MoonStars } from '@phosphor-icons/react/MoonStars';
@@ -15,249 +16,659 @@ import { Sparkle } from '@phosphor-icons/react/Sparkle';
 import { Sun } from '@phosphor-icons/react/Sun';
 import { Trophy } from '@phosphor-icons/react/Trophy';
 import { UserCircle } from '@phosphor-icons/react/UserCircle';
-import { articles, type Difficulty, type Language } from './data/articles';
-import { api, type User } from './lib/api';
-import { scoreTyping, splitCharacters } from './lib/scoring';
-import { resolveTheme, themeStorageKey, type Theme } from './lib/theme';
-import { localHistory, readDraft, usePractice, type History } from './hooks/usePractice';
+import { ArticleLibrary } from './components/ArticleLibrary';
 import { AuthDialog } from './components/AuthDialog';
 import { Dialog } from './components/Dialog';
+import { DraftsView } from './components/DraftsView';
+import { MistakesView } from './components/MistakesView';
+import { PracticeLines } from './components/PracticeLines';
+import { RankingView } from './components/RankingView';
+import { RecordsView } from './components/RecordsView';
+import { SettingsDialog } from './components/SettingsDialog';
+import { StatsView } from './components/StatsView';
+import { articles, type Difficulty, type Language } from './data/articles';
+import { continuationDraftId, discardSavedDraft, localHistory, practiceDraftId, readDraft, readDrafts, savedPracticeFromLegacy, usePractice, type PracticeDraft } from './hooks/usePractice';
+import { useWorkspace } from './hooks/useWorkspace';
+import { api, type User } from './lib/api';
+import { type ArticleSnapshot, type PracticeRecord, type ReaderSettings, type SavedPractice } from './lib/models';
+import { readableCharacter } from './lib/practice-lines';
+import { scoreTyping, splitCharacters } from './lib/scoring';
+import { resolveTheme, themeStorageKey, type Theme } from './lib/theme';
+import { deleteWorkspaceValue, DraftDeletedError, isWorkspaceDraftDeleted, putWorkspaceValue } from './lib/workspace';
 
-type View = 'practice' | 'rankings' | 'history' | 'admin';
-type Ranking = { nickname: string; speed: number; accuracy: number; guest: number; createdAt: number; attemptId: string };
+type View = 'practice' | 'library' | 'rankings' | 'history' | 'drafts' | 'mistakes' | 'stats' | 'admin';
 type ReviewEntry = { id: string; nickname: string; language: Language; difficulty: Difficulty; duration: number; speed: number; accuracy: number; checkpoints: number; reasons: string[] };
-
+type PendingLoad = { legacy: PracticeDraft } | { draft: SavedPractice; newRound?: boolean };
 const difficultyNames: Record<Difficulty, string> = { beginner: '入门', intermediate: '进阶', advanced: '挑战' };
 const languageNames: Record<Language, string> = { zh: '中文', en: 'English' };
 const reviewReasonNames: Record<string, string> = { paste_or_drop: '检测到粘贴或拖放', unusual_progress: '输入进度异常', missing_activity: '练习进度记录不足', stale_activity: '结束前进度记录缺失', high_speed: '速度较高', paused_session: '练习曾暂停或恢复', timing_discrepancy: '计时差异较大' };
+const builtIns: ArticleSnapshot[] = articles.map(({ content, ...article }) => ({ ...article, text: content, custom: false }));
+const builtInById = new Map(builtIns.map((article) => [article.id, article]));
+const recordViews: View[] = ['history', 'mistakes', 'stats'];
+
 function formatTime(milliseconds: number) {
   const seconds = Math.max(0, Math.ceil(milliseconds / 1000));
   return `${String(Math.floor(seconds / 60)).padStart(2, '0')}:${String(seconds % 60).padStart(2, '0')}`;
 }
-function formatDate(timestamp: number) {
-  return new Intl.DateTimeFormat('zh-CN', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }).format(timestamp);
-}
+
 function initialTheme(): Theme {
   let saved: string | null = null;
-  try { saved = localStorage.getItem(themeStorageKey); } catch { /* Use the system preference when storage is unavailable. */ }
+  try { saved = localStorage.getItem(themeStorageKey); } catch { /* The system preference is still available. */ }
   return resolveTheme(saved, typeof window !== 'undefined' && !!window.matchMedia?.('(prefers-color-scheme: dark)').matches);
 }
 
+function legacyArticle(draft: PracticeDraft): ArticleSnapshot {
+  const builtIn = builtInById.get(draft.articleId);
+  if (draft.article) return { ...draft.article, text: draft.target };
+  if (builtIn?.text === draft.target && builtIn.title === draft.title) return builtIn;
+  return { id: draft.articleId, title: draft.title, text: draft.target, language: draft.language, difficulty: draft.difficulty, custom: draft.custom };
+}
+
+function mergeRecords(local: PracticeRecord[], remote: PracticeRecord[], workspace: PracticeRecord[]) {
+  const recordKey = (record: PracticeRecord) => record.recordId || `${record.finishedAt}:${record.language}:${record.difficulty}:${record.speed}:${record.accuracy}`;
+  const statuses = new Map(remote.flatMap((record) => record.status ? [[recordKey(record), record.status] as const] : []));
+  const entries = new Map<string, PracticeRecord>();
+  for (const record of [...local, ...remote, ...workspace]) {
+    const key = recordKey(record);
+    const previous = entries.get(key);
+    if (!previous) { entries.set(key, record); continue; }
+    const rich = [record, previous].find((entry) => entry.article && entry.typed != null);
+    const mistakes = [record, previous].find((entry) => entry.mistakes?.length)?.mistakes;
+    entries.set(key, { ...previous, ...record, ...rich && { article: rich.article, typed: rich.typed, offset: rich.offset, articleTotal: rich.articleTotal }, ...mistakes && { mistakes } });
+  }
+  return [...entries].map(([key, record]) => {
+    const status = statuses.get(key);
+    return status ? { ...record, status } : record;
+  }).sort((a, b) => b.finishedAt - a.finishedAt);
+}
+
 export function App() {
-  const initialDraft = useMemo(() => readDraft(), []);
-  const [theme, setTheme] = useState<Theme>(initialTheme);
+  const [user, setUser] = useState<User | null>(null);
+  const [authReady, setAuthReady] = useState(false);
+  const request = useRef<AbortController | null>(null);
+  const changeUser = useCallback((next: User | null) => {
+    request.current?.abort();
+    setUser(next);
+    setAuthReady(true);
+  }, []);
+
+  useEffect(() => {
+    function checkAccount() {
+      request.current?.abort();
+      const controller = new AbortController();
+      request.current = controller;
+      api<{ user: User | null }>('/api/me', { timeoutMs: 3000, signal: controller.signal }).then(({ user: current }) => {
+        if (!controller.signal.aborted) setUser(current ?? null);
+      }).catch(() => {}).finally(() => {
+        if (!controller.signal.aborted) setAuthReady(true);
+      });
+    }
+    checkAccount();
+    window.addEventListener('focus', checkAccount);
+    return () => {
+      request.current?.abort();
+      window.removeEventListener('focus', checkAccount);
+    };
+  }, []);
+
+  return <PracticeApp key={user ? `account:${user.id}` : 'guest'} user={user} authReady={authReady} onUser={changeUser} />;
+}
+
+function PracticeApp({ user, authReady, onUser }: { user: User | null; authReady: boolean; onUser: (user: User | null) => void }) {
+  const ownerId = user?.id ?? null;
+  const workspace = useWorkspace(ownerId, authReady);
+  const [selection, setSelection] = useState(builtIns[0]);
+  const [guestTheme, setGuestTheme] = useState(initialTheme);
   const [view, setView] = useState<View>('practice');
-  const [language, setLanguage] = useState<Language>(initialDraft?.language ?? 'zh');
-  const [difficulty, setDifficulty] = useState<Difficulty>(initialDraft?.difficulty ?? 'beginner');
-  const [minutesText, setMinutesText] = useState(initialDraft ? String(initialDraft.duration / 60) : '5');
-  const [articleId, setArticleId] = useState(initialDraft?.articleId ?? 'zh-beginner-1');
-  const [customText, setCustomText] = useState(initialDraft?.custom ? initialDraft.target : '');
+  const [minutesText, setMinutesText] = useState<string>();
+  const [pendingTheme, setPendingTheme] = useState<Theme>();
   const [customDraft, setCustomDraft] = useState('');
   const [customError, setCustomError] = useState('');
   const [showCustom, setShowCustom] = useState(false);
   const [showResult, setShowResult] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
+  const [showMore, setShowMore] = useState(false);
+  const [focused, setFocused] = useState(false);
+  const [showAuth, setShowAuth] = useState(false);
+  const [confirmPractice, setConfirmPractice] = useState<{ action: 'restart' | 'finish'; resumeOnCancel: boolean } | null>(null);
   const [nickname, setNickname] = useState('');
   const [rankMessage, setRankMessage] = useState('');
   const [rankSubmitted, setRankSubmitted] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [accountBusy, setAccountBusy] = useState(false);
   const [feedback, setFeedback] = useState('');
-  const [user, setUser] = useState<User | null>(null);
-  const [authReady, setAuthReady] = useState(false);
-  const [showAuth, setShowAuth] = useState(false);
-  const [rankings, setRankings] = useState<Ranking[]>([]);
-  const [history, setHistory] = useState<History[]>([]);
+  const [pendingLoad, setPendingLoad] = useState<PendingLoad>();
+  const [remoteHistory, setRemoteHistory] = useState<PracticeRecord[]>([]);
   const [review, setReview] = useState<ReviewEntry[]>([]);
-  const [loading, setLoading] = useState(false);
-  const rankRequest = useRef<AbortController | null>(null);
-  const rankRequestId = useRef(0);
-  const activeCharacterRef = useRef<HTMLSpanElement>(null);
-  const availableArticles = useMemo(() => articles.filter((item) => item.language === language && item.difficulty === difficulty), [language, difficulty]);
-  const selectedArticle = articles.find((item) => item.id === articleId) || availableArticles[0];
-  const minutes = Number(minutesText);
-  const validDuration = /^\d+$/.test(minutesText) && Number.isInteger(minutes) && minutes >= 1 && minutes <= 60;
-  const duration = validDuration ? minutes * 60 : 0;
-  const displayTitle = customText ? '自定义文字' : selectedArticle.title;
-  const practice = usePractice({ articleId, title: displayTitle, text: customText || selectedArticle.content, language, difficulty, duration, custom: !!customText, ownerId: user?.id ?? null }, initialDraft);
+  const [historyError, setHistoryError] = useState(false);
+  const bootstrapped = useRef(false);
+  const interacted = useRef(false);
+  const navigation = useRef(false);
+  const moreMenu = useRef<HTMLDivElement>(null);
+  const moreButton = useRef<HTMLButtonElement>(null);
+  const focusButton = useRef<HTMLButtonElement>(null);
+  const focusRoot = useRef<HTMLDivElement>(null);
+  const live = useRef(true);
+  const { language, difficulty, title: displayTitle, text } = selection;
+  const catalog = useMemo(() => [...builtIns, ...workspace.privateArticles], [workspace.privateArticles]);
+  const availableArticles = useMemo(() => catalog.filter((article) => article.language === language && article.difficulty === difficulty), [catalog, difficulty, language]);
+  const configuredMinutes = minutesText ?? String(workspace.settings.minutes);
+  const minutes = Number(configuredMinutes);
+  const validDuration = /^\d+$/.test(configuredMinutes) && minutes >= 1 && minutes <= 60;
+  const duration = validDuration ? minutes * 60 : workspace.settings.minutes * 60;
+  const theme = user ? pendingTheme ?? workspace.settings.theme : guestTheme;
+  const ready = authReady && workspace.ready;
+  const reportSaveError = useCallback(() => { if (live.current) setFeedback('无法保存进度'); }, []);
+
+  const practice = usePractice({
+    article: selection, articleId: selection.id, title: displayTitle, text, language, difficulty, duration,
+    custom: selection.custom || builtInById.get(selection.id)?.text !== text, ownerId,
+    mode: workspace.settings.mode, strict: workspace.settings.strict, autoPause: workspace.settings.autoPause,
+    onRecord(record) {
+      if (record.recordId) void putWorkspaceValue(record.ownerId ?? null, 'record', record.recordId, record).catch(reportSaveError);
+    },
+    onDraft(draft) {
+      return putWorkspaceValue(draft.ownerId, 'draft', draft.id, draft).catch((error: unknown) => {
+        if (error instanceof DraftDeletedError) throw error;
+        reportSaveError();
+      });
+    },
+    isDraftDeleted: (id, owner) => isWorkspaceDraftDeleted(owner, id),
+    onRemoveDraft(id, owner) {
+      void deleteWorkspaceValue(owner, 'draft', id).catch(reportSaveError);
+    },
+  }, null);
   const { phase, target, typed, result } = practice;
   const locked = !['ready', 'finished'].includes(phase);
-  const previewScore = scoreTyping(target, typed, Math.max(practice.elapsedMs / 1000, 0.1));
+  const currentMode = phase === 'ready' ? workspace.settings.mode : practice.mode;
+  const currentDuration = phase === 'ready' ? duration : practice.duration;
+  const currentStrict = phase === 'ready' ? workspace.settings.strict : practice.strict;
+  const canStart = ready && !pendingLoad && !accountBusy && !locked && (validDuration || currentMode === 'article');
   const typedCharacters = useMemo(() => splitCharacters(typed), [typed]);
   const targetCharacters = useMemo(() => splitCharacters(target), [target]);
-  const remainingMs = Math.max(0, duration * 1000 - practice.elapsedMs);
+  const roundTyped = useMemo(() => typedCharacters.slice(practice.offset).join(''), [typedCharacters, practice.offset]);
+  const roundTarget = useMemo(() => targetCharacters.slice(practice.offset, typedCharacters.length).join(''), [targetCharacters, typedCharacters.length, practice.offset]);
+  const previewScore = useMemo(() => scoreTyping(roundTarget, roundTyped, Math.max(practice.elapsedMs / 1000, 0.1)), [roundTarget, roundTyped, practice.elapsedMs]);
+  const clockMs = currentMode === 'article' ? practice.elapsedMs : Math.max(0, currentDuration * 1000 - practice.elapsedMs);
+  const practiceNotice = feedback || practice.feedback || (!locked && currentMode === 'timed' && !validDuration ? '时长须为 1–60 分钟的整数。' : '');
+  const mistakes = useMemo(() => typedCharacters.flatMap((character, index) => index >= practice.offset && character !== targetCharacters[index] ? [{ index, expected: targetCharacters[index], actual: character }] : []), [typedCharacters, targetCharacters, practice.offset]);
 
   useEffect(() => {
-    let active = true;
-    api<{ user: User | null }>('/api/me', { timeoutMs: 3000 }).then((data) => { if (active) setUser(data.user); }).catch(() => {}).finally(() => { if (active) setAuthReady(true); });
-    return () => { active = false; };
+    live.current = true;
+    return () => { live.current = false; };
   }, []);
+
+  useEffect(() => {
+    if (!ready || bootstrapped.current || (ownerId && !workspace.cloudLoaded)) return;
+    bootstrapped.current = true;
+    const deleted = new Set(workspace.deletedDraftIds);
+    const preferred = readDraft(ownerId);
+    const recoverable = (draft: PracticeDraft) => draft.completed || !deleted.has(practiceDraftId(draft.recordId));
+    const legacy = preferred && recoverable(preferred) ? preferred : readDrafts(ownerId).find(recoverable);
+    if (!interacted.current && phase === 'ready' && legacy) {
+      setSelection(legacyArticle(legacy));
+      setPendingLoad({ legacy });
+    }
+  }, [ready, ownerId, phase, workspace.cloudLoaded, workspace.deletedDraftIds]);
+
+  const loadCurrent = useRef(practice);
+  loadCurrent.current = practice;
+  useEffect(() => {
+    if (!pendingLoad) return;
+    setPendingLoad(undefined);
+    if ('legacy' in pendingLoad) void loadCurrent.current.loadLegacy(pendingLoad.legacy);
+    else void loadCurrent.current.loadSaved(pendingLoad.draft, { newRound: pendingLoad.newRound });
+  }, [pendingLoad]);
+
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
-    try { localStorage.setItem(themeStorageKey, theme); } catch { /* Theme switching still works for this visit. */ }
   }, [theme]);
+
   useEffect(() => {
-    if (phase === 'running' && activeCharacterRef.current) activeCharacterRef.current.scrollIntoView({ block: 'nearest', inline: 'nearest' });
-  }, [typedCharacters.length, phase]);
+    if (pendingTheme === workspace.settings.theme) setPendingTheme(undefined);
+  }, [pendingTheme, workspace.settings.theme]);
+
+  useEffect(() => {
+    if (minutesText !== undefined && validDuration && minutes === workspace.settings.minutes) setMinutesText(undefined);
+  }, [minutes, minutesText, validDuration, workspace.settings.minutes]);
+
   useEffect(() => {
     if (result) { setRankMessage(''); setRankSubmitted(false); setShowResult(true); }
   }, [result]);
 
-  function resetPractice(nextText = customText || selectedArticle.content) {
-    practice.reset(nextText); setRankMessage(''); setRankSubmitted(false);
+  useEffect(() => {
+    if (!ownerId || !recordViews.includes(view)) return;
+    const controller = new AbortController();
+    setHistoryError(false);
+    api<{ entries: PracticeRecord[] }>('/api/history', { signal: controller.signal, headers: { 'X-Workspace-Owner': ownerId } }).then(({ entries }) => {
+      if (!controller.signal.aborted && Array.isArray(entries)) setRemoteHistory(entries);
+    }).catch(() => {
+      if (!controller.signal.aborted) { setRemoteHistory([]); setHistoryError(true); }
+    });
+    return () => controller.abort();
+  }, [view, ownerId, result]);
+
+  const records = useMemo(() => {
+    if (!authReady) return [];
+    const local = localHistory().filter((record) => (record.ownerId ?? null) === ownerId);
+    return mergeRecords(local, remoteHistory, workspace.records);
+  }, [authReady, ownerId, remoteHistory, workspace.records, result, view]);
+
+  const draftBox = useMemo(() => {
+    if (!ready || view !== 'drafts') return { drafts: [], completed: [] };
+    const drafts = new Map(workspace.drafts.map((draft) => [draft.recordId, draft]));
+    const deleted = new Set(workspace.deletedDraftIds);
+    const completed: PracticeDraft[] = [];
+    for (const draft of readDrafts(ownerId)) {
+      if (draft.completed) {
+        drafts.delete(draft.recordId);
+        completed.push(draft);
+      } else if (!drafts.has(draft.recordId) && !deleted.has(practiceDraftId(draft.recordId))) {
+        drafts.set(draft.recordId, savedPracticeFromLegacy(draft));
+      }
+    }
+    return { drafts: [...drafts.values()], completed };
+  }, [ready, view, ownerId, workspace.drafts, workspace.deletedDraftIds]);
+
+  useEffect(() => {
+    if (!showMore) return;
+    const closeOutside = (event: PointerEvent) => {
+      if (!moreMenu.current?.contains(event.target as Node)) setShowMore(false);
+    };
+    const closeWithEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') { setShowMore(false); moreButton.current?.focus(); }
+    };
+    document.addEventListener('pointerdown', closeOutside);
+    document.addEventListener('keydown', closeWithEscape);
+    return () => {
+      document.removeEventListener('pointerdown', closeOutside);
+      document.removeEventListener('keydown', closeWithEscape);
+    };
+  }, [showMore]);
+
+  useEffect(() => {
+    if (!focused) return;
+    focusButton.current?.focus();
+    let wasFullscreen = document.fullscreenElement === focusRoot.current;
+    const fullscreenChange = () => {
+      if (document.fullscreenElement === focusRoot.current) wasFullscreen = true;
+      else if (wasFullscreen) setFocused(false);
+    };
+    const escape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape' && !showResult && !confirmPractice) exitFocus();
+    };
+    document.addEventListener('fullscreenchange', fullscreenChange);
+    document.addEventListener('keydown', escape);
+    return () => {
+      document.removeEventListener('fullscreenchange', fullscreenChange);
+      document.removeEventListener('keydown', escape);
+    };
+  }, [focused, showResult, confirmPractice]);
+
+  function exitFocus() {
+    setFocused(false);
+    if (document.fullscreenElement === focusRoot.current) void document.exitFullscreen?.().catch(() => {});
   }
+
+  function enterFocus() {
+    setShowSettings(false);
+    setView('practice');
+    setFocused(true);
+    try { void focusRoot.current?.requestFullscreen?.().catch(() => {}); } catch { /* Embedded preview still uses focus layout. */ }
+  }
+
+  function toggleTheme() {
+    const next = theme === 'dark' ? 'light' : 'dark';
+    if (user) {
+      setPendingTheme(next);
+      void workspace.updateSettings({ theme: next }).catch(() => {
+        setPendingTheme((pending) => pending === next ? undefined : pending);
+        reportSaveError();
+      });
+      return;
+    }
+    setGuestTheme(next);
+    try { localStorage.setItem(themeStorageKey, next); } catch { /* The current view still changes. */ }
+  }
+
+  function updateSettings(patch: Partial<ReaderSettings>) {
+    if (patch.minutes !== undefined) setMinutesText(String(patch.minutes));
+    if (phase === 'finished' && (patch.mode !== undefined || patch.strict !== undefined || patch.minutes !== undefined)) {
+      resetPractice(selection, true);
+    }
+    void workspace.updateSettings(patch).catch(reportSaveError);
+  }
+
+  function resetPractice(article = selection, keepDraft = false) {
+    interacted.current = true;
+    setSelection(article);
+    practice.reset(article.text, { keepDraft });
+    setShowResult(false);
+    setRankMessage('');
+    setRankSubmitted(false);
+    setFeedback('');
+  }
+
+  async function afterPark(action: () => void | Promise<void>) {
+    if (navigation.current) return;
+    navigation.current = true;
+    interacted.current = true;
+    try {
+      if (locked && !await practice.park()) {
+        if (phase === 'starting' || phase === 'finishing') setFeedback('练习保存中…');
+        return;
+      }
+      const pending = live.current ? action() : undefined;
+      if (pending) await pending;
+    } finally {
+      navigation.current = false;
+    }
+  }
+
+  function navigate(next: View) {
+    setShowMore(false);
+    if (next === view) return;
+    void afterPark(() => { setShowResult(false); setFeedback(''); setView(next); });
+  }
+
+  function openSettings() {
+    setShowMore(false);
+    void afterPark(() => setShowSettings(true));
+  }
+
+  function selectArticle(article: ArticleSnapshot) {
+    void afterPark(() => {
+      resetPractice(article, true);
+      setView('practice');
+    });
+  }
+
+  function continueDraft(draft: SavedPractice, newRound = false) {
+    void afterPark(() => {
+      setShowResult(false);
+      setFeedback('');
+      setSelection(draft.article);
+      const legacy = !newRound && readDrafts(ownerId).find((item) => item.legacy && item.recordId === draft.recordId);
+      setPendingLoad(legacy ? { legacy } : { draft, newRound });
+      setView('practice');
+    });
+  }
+
+  function continueRecord(record: PracticeRecord) {
+    if (!record.article || record.typed == null) return;
+    const article = record.article;
+    const continuationId = record.recordId ? continuationDraftId(record.recordId) : undefined;
+    const saved = workspace.drafts.find((draft) => draft.id === continuationId);
+    const typed = splitCharacters(record.typed);
+    const expected = splitCharacters(article.text);
+    const wrong = record.strict ? typed.findIndex((character, index) => character !== expected[index]) : -1;
+    const offset = wrong >= 0 ? wrong : typed.length;
+    if (saved && (saved.offset >= offset || splitCharacters(saved.typed).length >= typed.length)) {
+      continueDraft(saved);
+      return;
+    }
+    const recordId = `resume-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const draft: SavedPractice = {
+      id: practiceDraftId(recordId), article, typed: record.typed, elapsedMs: 0, backspaces: 0, duration: record.duration,
+      mode: record.mode ?? 'timed', strict: !!record.strict, offset, recordId,
+      ownerId, savedAt: Date.now(), offline: true,
+    };
+    continueDraft(draft, true);
+  }
+
+  function deleteDraft(id: string) {
+    const draft = draftBox.drafts.find((item) => item.id === id);
+    if (!draft) return;
+    void afterPark(() => {
+      if (!discardSavedDraft(draft)) { setFeedback('草稿正在其他页面使用'); return; }
+      if (practice.draftId === id) resetPractice(selection, true);
+      void workspace.remove('draft', id).catch(reportSaveError);
+    });
+  }
+
+  function nextArticle() {
+    if (locked) return;
+    const index = availableArticles.findIndex((article) => article.id === selection.id);
+    resetPractice(availableArticles[(index + 1) % availableArticles.length] ?? builtIns[0], true);
+  }
+
+  async function requestPracticeAction(action: 'restart' | 'finish') {
+    const resumeOnCancel = phase === 'running';
+    if (resumeOnCancel && !await practice.pause()) return;
+    setConfirmPractice({ action, resumeOnCancel });
+  }
+
+  function cancelPracticeAction() {
+    const resume = confirmPractice?.resumeOnCancel;
+    setConfirmPractice(null);
+    if (resume) void practice.resume();
+  }
+
   function changeLanguage(next: Language) {
-    if (locked) return;
-    const nextArticle = articles.find((item) => item.language === next && item.difficulty === difficulty)!;
-    setLanguage(next); setArticleId(nextArticle.id); setCustomText(''); resetPractice(nextArticle.content);
+    if (locked || next === language) return;
+    resetPractice(builtIns.find((item) => item.language === next && item.difficulty === difficulty)!, true);
   }
+
   function changeDifficulty(next: Difficulty) {
-    if (locked) return;
-    const nextArticle = articles.find((item) => item.language === language && item.difficulty === next)!;
-    setDifficulty(next); setArticleId(nextArticle.id); setCustomText(''); resetPractice(nextArticle.content);
+    if (locked || next === difficulty) return;
+    resetPractice(builtIns.find((item) => item.language === language && item.difficulty === next)!, true);
   }
+
   function changeDuration(event: ChangeEvent<HTMLInputElement>) {
     if (locked) return;
-    setMinutesText(event.target.value);
-    if (phase === 'finished') resetPractice();
+    const value = event.target.value;
+    setMinutesText(value);
+    if (/^\d+$/.test(value) && Number(value) >= 1 && Number(value) <= 60) {
+      void workspace.updateSettings({ minutes: Number(value) }).catch(reportSaveError);
+    }
+    if (phase === 'finished') resetPractice(selection, true);
   }
+
   function changeArticle(event: ChangeEvent<HTMLSelectElement>) {
-    const article = articles.find((item) => item.id === event.target.value);
-    if (!article || locked) return;
-    setArticleId(article.id); setCustomText(''); resetPractice(article.content);
+    const article = catalog.find((item) => item.id === event.target.value);
+    if (article && !locked) resetPractice(article, true);
   }
+
   function useCustomText() {
-    const value = customDraft.replace(/\r\n?/g, '\n').trim();
-    if (!value || splitCharacters(value).length > 20000) { setCustomError('请输入 1–20000 个字符的练习文字。'); return; }
-    setCustomText(value); setArticleId('custom'); setCustomError(''); setShowCustom(false); resetPractice(value);
+    const value = customDraft.replace(/\r\n?/g, '\n').trim().normalize('NFC');
+    if (!value || value.length > 20000) { setCustomError('请输入 1–20,000 个字符。'); return; }
+    setCustomError('');
+    setShowCustom(false);
+    resetPractice({ id: 'custom', title: '自定义文字', text: value, language, difficulty, custom: true }, true);
   }
+
   async function submitRank() {
     if (!result?.attemptId) return;
     setBusy(true); setRankMessage('');
     try {
       const data = await api<{ status: string }>('/api/leaderboard', { method: 'POST', body: { attemptId: result.attemptId, nickname } });
-      setRankMessage(data.status === 'review' ? '成绩已提交，正在等待复核。' : '成绩已提交到排行榜！');
+      setRankMessage(data.status === 'review' ? '已提交，待复核。' : '已上榜。');
       setRankSubmitted(true);
     } catch (problem) { setRankMessage((problem as Error).message); setRankSubmitted(false); }
     finally { setBusy(false); }
   }
-  const loadRankings = useCallback(async () => {
-    rankRequest.current?.abort();
-    if (!validDuration) { setRankings([]); setFeedback('请输入 1–60 分钟的整数。'); return; }
-    const controller = new AbortController();
-    rankRequest.current = controller;
-    const requestId = ++rankRequestId.current;
-    setLoading(true); setFeedback('');
+
+  const loadReview = useCallback(async (signal?: AbortSignal) => {
     try {
-      const data = await api<{ entries: Ranking[] }>(`/api/leaderboard?language=${language}&difficulty=${difficulty}&duration=${duration}`, { signal: controller.signal });
-      if (!controller.signal.aborted && requestId === rankRequestId.current) setRankings(data.entries);
+      const data = await api<{ entries: ReviewEntry[] }>('/api/admin/review', { signal });
+      if (!signal?.aborted) setReview(data.entries);
     } catch (problem) {
-      if (!controller.signal.aborted && requestId === rankRequestId.current) { setRankings([]); setFeedback((problem as Error).message); }
-    } finally {
-      if (!controller.signal.aborted && requestId === rankRequestId.current) setLoading(false);
+      if (!signal?.aborted) setFeedback((problem as Error).message);
     }
-  }, [language, difficulty, duration, validDuration]);
-  const loadHistory = useCallback(async () => {
-    setLoading(true); setFeedback('');
-    const ownLocal = localHistory().filter((entry) => user ? entry.ownerId === user.id || (!entry.ownerId && entry.localOnly) : !entry.ownerId);
-    try {
-      if (!user) setHistory(ownLocal);
-      else {
-        const remote = (await api<{ entries: History[] }>('/api/history')).entries;
-        const remoteIds = new Set(remote.map((entry) => entry.recordId));
-        setHistory([...remote, ...ownLocal.filter((entry) => entry.localOnly && !remoteIds.has(entry.recordId))].sort((a, b) => b.finishedAt - a.finishedAt));
-      }
-    } catch { setHistory(ownLocal); setFeedback('暂时无法连接服务，正在显示本机记录。'); }
-    finally { setLoading(false); }
-  }, [user]);
-  const loadReview = useCallback(async () => {
-    setLoading(true); setFeedback('');
-    try { setReview((await api<{ entries: ReviewEntry[] }>('/api/admin/review')).entries); }
-    catch (problem) { setFeedback((problem as Error).message); }
-    finally { setLoading(false); }
   }, []);
+
   useEffect(() => {
-    if (view === 'rankings') {
-      void loadRankings();
-      return () => { rankRequest.current?.abort(); rankRequestId.current++; };
-    }
-    if (view === 'history') void loadHistory();
-    if (view === 'admin') void loadReview();
-  }, [view, loadRankings, loadHistory, loadReview]);
+    if (view !== 'admin' || !user?.isAdmin) return;
+    const controller = new AbortController();
+    void loadReview(controller.signal);
+    return () => controller.abort();
+  }, [view, user?.isAdmin, loadReview]);
+
   async function reviewAction(id: string, action: 'approve' | 'reject') {
     try { await api(`/api/admin/review/${id}`, { method: 'POST', body: { action } }); await loadReview(); }
     catch (problem) { setFeedback((problem as Error).message); }
   }
-  async function removeScore(id: string) {
-    try { await api(`/api/admin/remove/${id}`, { method: 'POST', body: {} }); await loadRankings(); }
-    catch (problem) { setFeedback((problem as Error).message); }
-  }
-  async function logout() {
-    try { await api('/api/auth/logout', { method: 'POST', body: {} }); setUser(null); setView('practice'); }
-    catch (problem) { setFeedback((problem as Error).message); }
-  }
-  function navigate(next: View) {
-    if (locked) { setFeedback(phase === 'finishing' ? '正在保存本次成绩，请稍候。' : '请先完成或重新开始当前练习。'); return; }
-    setFeedback(''); setView(next);
+
+  const canChangeAccount = authReady && !pendingLoad && !accountBusy &&
+    ['ready', 'running', 'paused', 'finished'].includes(phase);
+
+  async function changeAccount() {
+    if (!canChangeAccount) return;
+    setAccountBusy(true);
+    try {
+      await afterPark(async () => {
+        if (!user) { setShowAuth(true); return; }
+        await api('/api/auth/logout', { method: 'POST', body: {} });
+        if (live.current) onUser(null);
+      });
+    } catch (problem) {
+      if (live.current) setFeedback((problem as Error).message);
+    } finally {
+      if (live.current) setAccountBusy(false);
+    }
   }
 
+  const matchingArticle = availableArticles.find((article) => article.id === selection.id);
+  const snapshotOption = !matchingArticle || matchingArticle.title !== selection.title || matchingArticle.text !== selection.text;
+  const selectedOption = snapshotOption ? 'current-snapshot' : selection.id;
+  const source = selection.source && /^https?:\/\//iu.test(selection.source.url) ? selection.source : undefined;
   const filters = <>
     <div className="top-filters">
       <div className="segmented language-switch" role="group" aria-label="选择语言">
         {(['zh', 'en'] as const).map((item) => <button key={item} disabled={locked} aria-pressed={language === item} onClick={() => changeLanguage(item)}>{languageNames[item]}</button>)}
       </div>
       <span className="filter-divider" aria-hidden="true" />
-      <label className="duration-input"><Clock size={21} /><span>测试时间</span><input type="number" min="1" max="60" step="1" aria-label="测试时间（分钟）" aria-invalid={!validDuration} value={minutesText} disabled={locked} onChange={changeDuration} /><span>分钟</span></label>
+      {currentMode === 'timed' ? <label className="duration-input"><Clock size={21} /><span>测试时间</span><input type="number" min="1" max="60" step="1" aria-label="测试时间（分钟）" aria-invalid={!locked && !validDuration} value={phase === 'ready' ? configuredMinutes : String(currentDuration / 60)} disabled={locked} onChange={changeDuration} /><span>分钟</span></label> : <span className="count-chip">整篇</span>}
+      {currentStrict && <span className="count-chip">严格纠错</span>}
     </div>
     <div className="detail-filters">
-      {view === 'practice' && <div className="article-choice"><label className="article-picker"><BookOpen size={24} /><span>选择文章</span><span className="select-wrap"><select value={articleId} disabled={locked} onChange={changeArticle} aria-label="选择练习文章">{customText && <option value="custom">自定义文字</option>}{availableArticles.map((article) => <option key={article.id} value={article.id}>{article.title}</option>)}</select><CaretDown aria-hidden="true" size={17} /></span></label><button className="text-button custom-button" disabled={locked} onClick={() => { setCustomDraft(customText); setCustomError(''); setShowCustom(true); }}>自定义文字</button></div>}
+      <div className="article-choice"><label className="article-picker"><BookOpen size={24} /><span>选择文章</span><span className="select-wrap"><select value={selectedOption} disabled={locked} onChange={changeArticle} aria-label="选择练习文章">{snapshotOption && <option value="current-snapshot">{selection.title}</option>}{availableArticles.map((article) => <option key={article.id} value={article.id}>{article.title}{article.author ? ` · ${article.author}` : ''}</option>)}</select><CaretDown aria-hidden="true" size={17} /></span></label><button className="text-button custom-button" disabled={locked} onClick={() => { setCustomDraft(selection.id === 'custom' ? text : ''); setCustomError(''); setShowCustom(true); }}>自定义文字</button></div>
       <div className="difficulty-picker"><span>难度：</span><div className="segmented difficulty-switch" role="group" aria-label="选择难度">{(['beginner', 'intermediate', 'advanced'] as const).map((item) => <button key={item} disabled={locked} aria-pressed={difficulty === item} onClick={() => changeDifficulty(item)}>{difficultyNames[item]}</button>)}</div></div>
     </div>
   </>;
 
-  return <div className="app-shell">
-    <header className="site-header">
+  const actionNames = { library: '文章库', practice: '练习', rankings: '排行榜', history: '我的记录' } as const;
+  const secondaryNames = { drafts: '草稿箱', mistakes: '错字本', stats: '统计' } as const;
+
+  return <div className={`app-shell${focused ? ' app-focused' : ''}`} ref={focusRoot}>
+    {!focused && <header className="site-header">
       <button className="brand" onClick={() => navigate('practice')} aria-label="云打字练习首页"><Cloud size={40} weight="regular" /><span>云打字练习</span></button>
-      <span className="brand-subtitle">中文 / English 打字测试</span>
       <nav aria-label="主要导航">
-        <button className={view === 'practice' ? 'nav-active' : ''} onClick={() => navigate('practice')}>练习</button>
-        <button className={view === 'rankings' ? 'nav-active' : ''} onClick={() => navigate('rankings')}>排行榜</button>
-        <button className={view === 'history' ? 'nav-active' : ''} onClick={() => navigate('history')}>我的记录</button>
+        {(['practice', 'library', 'rankings', 'history'] as const).map((item) => <button key={item} className={view === item ? 'nav-active' : ''} aria-current={view === item ? 'page' : undefined} onClick={() => navigate(item)}>{actionNames[item]}</button>)}
+        <div className="more-nav" ref={moreMenu}>
+          <button ref={moreButton} className={view === 'drafts' || view === 'mistakes' || view === 'stats' ? 'nav-active' : ''} aria-expanded={showMore} aria-controls={showMore ? 'practice-more' : undefined} onClick={() => setShowMore((value) => !value)}>更多 <CaretDown size={12} aria-hidden="true" /></button>
+          {showMore && <div className="more-popover" id="practice-more">
+            {(Object.keys(secondaryNames) as Array<keyof typeof secondaryNames>).map((item) => <button key={item} aria-current={view === item ? 'page' : undefined} onClick={() => { moreButton.current?.focus(); navigate(item); }}>{secondaryNames[item]}</button>)}
+            <button onClick={() => { moreButton.current?.focus(); openSettings(); }}>设置</button>
+          </div>}
+        </div>
         {user?.isAdmin && <button className={view === 'admin' ? 'nav-active' : ''} onClick={() => navigate('admin')}>审核</button>}
-        <button className="theme-button" aria-label={theme === 'dark' ? '切换至日间模式' : '切换至夜间模式'} aria-pressed={theme === 'dark'} onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}>{theme === 'dark' ? <Sun size={20} /> : <MoonStars size={20} />}<span>{theme === 'dark' ? '日间' : '夜间'}</span></button>
-        {user ? <button className="account-button" disabled={locked} onClick={logout} title="退出登录"><UserCircle size={21} /> {user.username} <SignOut size={16} /></button> : <button className="account-button" disabled={locked || !authReady} onClick={() => setShowAuth(true)}>登录</button>}
+        <button className="theme-button" aria-label={theme === 'dark' ? '切换至日间模式' : '切换至夜间模式'} aria-pressed={theme === 'dark'} onClick={toggleTheme}>{theme === 'dark' ? <Sun size={20} /> : <MoonStars size={20} />}<span>{theme === 'dark' ? '日间' : '夜间'}</span></button>
+        {user ? <button className="account-button" disabled={!canChangeAccount} onClick={() => void changeAccount()} title="退出登录"><UserCircle size={21} /> {user.username} <SignOut size={16} /></button> : <button className="account-button" disabled={!canChangeAccount} onClick={() => void changeAccount()}>登录</button>}
       </nav>
-    </header>
+    </header>}
     <main className="room">
       <div className="workspace">
-        {(view === 'practice' || view === 'rankings') && filters}
         {view === 'practice' && <>
-          <div className="status-row"><span><Clock size={23} /> 剩余时间：<b data-testid="remaining-time">{formatTime(remainingMs)}</b></span><span><Crosshair size={23} /> 准确率：{typed ? `${previewScore.accuracy}%` : '—'}</span><span><Keyboard size={23} /> {language === 'zh' ? '字 / 分钟' : 'WPM'}：{typed ? (language === 'zh' ? previewScore.cpm : previewScore.wpm) : '—'}</span></div>
-          <div className="progress-row"><span>文章字数：<b data-testid="article-count">{targetCharacters.length}</b></span><span>已打字数：<b data-testid="typed-count">{typedCharacters.length}</b></span><span>当前错误：<b data-testid="error-count">{previewScore.total - previewScore.correct}</b></span><span title="输入法候选词编辑不计入退格次数">退格：<b data-testid="backspace-count">{practice.backspaces}</b></span></div>
+          {focused ? <div className="focus-actions"><button ref={focusButton} className="outline-button feature-action-button" onClick={exitFocus}>退出专注</button></div> : filters}
+          <div className="status-row"><span><Clock size={23} /> {currentMode === 'article' ? '用时' : '剩余时间'}：<b data-testid="remaining-time">{formatTime(clockMs)}</b></span><span><Crosshair size={23} /> 准确率：{roundTyped ? `${previewScore.accuracy}%` : '—'}</span><span><Keyboard size={23} /> {language === 'zh' ? '字 / 分钟' : 'WPM'}：{roundTyped ? (language === 'zh' ? previewScore.cpm : previewScore.wpm) : '—'}</span></div>
+          <div className="progress-row"><span>文章字数：<b data-testid="article-count">{targetCharacters.length}</b></span><span>已打字数：<b data-testid="typed-count">{typedCharacters.length}</b></span><span>当前错误：<b data-testid="error-count">{previewScore.total - previewScore.correct}</b></span><span>退格：<b data-testid="backspace-count">{practice.backspaces}</b></span></div>
           <section className="typing-panel" aria-label="文章练习">
-            <div className="passage" aria-label={`当前文章：${displayTitle}`}>
-              {targetCharacters.map((character, index) => <span key={index} ref={index === typedCharacters.length ? activeCharacterRef : undefined} className={index < typedCharacters.length ? (typedCharacters[index] === character ? 'char-correct' : 'char-wrong') : index === typedCharacters.length && phase === 'running' ? 'char-current' : ''}>{character}</span>)}
+            <div className="practice-heading">
+              <div className="practice-title"><BookOpen size={22} aria-hidden="true" /><div>
+                <h1>{displayTitle}</h1>
+                {target === text && (selection.author || selection.theme || source) && <p className="article-meta">
+                  {selection.author && <span>{selection.author}</span>}
+                  {selection.theme && <span>{selection.theme}</span>}
+                  {source && <a href={source.url} target="_blank" rel="noopener noreferrer" title={source.name} aria-label={`查看《${displayTitle}》原文`}>查看原文</a>}
+                </p>}
+              </div></div>
+              <div className="practice-actions">
+                {phase === 'running' ? <button className="primary-button start-button" onClick={() => void practice.pause()}><Pause size={18} weight="fill" aria-hidden="true" /> 暂停练习</button>
+                  : phase === 'paused' ? <button className="primary-button start-button" disabled={!ready || accountBusy} onClick={() => void practice.resume()}><Play size={18} weight="fill" aria-hidden="true" /> 继续练习</button>
+                    : <button className="primary-button start-button" onClick={phase === 'finished' ? () => resetPractice(selection, true) : () => { interacted.current = true; void practice.start(); }} disabled={!canStart}>
+                      {phase === 'starting' ? '准备中…' : phase === 'restoring' ? '恢复进度中…' : phase === 'pausing' ? '正在暂停…' : phase === 'resuming' ? '正在继续…' : phase === 'finishing' ? '正在结算…' : phase === 'finished' ? '再练一次' : <><Play size={18} weight="fill" aria-hidden="true" /> 开始练习</>}
+                    </button>}
+                {(phase === 'running' || phase === 'paused') && <><button className="text-button restart-button" onClick={() => void requestPracticeAction('restart')}><ArrowCounterClockwise size={18} aria-hidden="true" />重新开始</button><button className="text-button" onClick={() => void requestPracticeAction('finish')}>结束练习</button></>}
+                {phase === 'ready' && !focused && <button className="text-button" onClick={nextArticle}>换一篇 <ArrowRight size={16} aria-hidden="true" /></button>}
+                {phase === 'finished' && <button className="text-button" onClick={() => setShowResult(true)}>查看本次成绩</button>}
+              </div>
             </div>
-            <label className="sr-only" htmlFor="typing-input">在此输入上方文章，中文候选字上屏后计入成绩</label>
-            <textarea id="typing-input" ref={practice.textareaRef} value={practice.raw} disabled={phase !== 'running'} onChange={practice.onChange} onKeyDown={practice.onKeyDown} onCompositionStart={practice.onCompositionStart} onCompositionEnd={practice.onCompositionEnd} onPaste={practice.markSuspicious} onDrop={practice.markSuspicious} placeholder={phase === 'running' ? '在这里输入文章…' : phase === 'paused' ? '练习已暂停' : '点击下方按钮开始练习'} spellCheck={false} autoComplete="off" />
+            <PracticeLines practice={practice} title={displayTitle} reader={workspace.settings} />
           </section>
-          <div className="practice-actions">
-            {phase === 'running' ? <button className="primary-button start-button" onClick={() => void practice.pause()}><Pause size={22} weight="fill" /> 暂停练习</button> : phase === 'paused' ? <><button className="primary-button start-button" disabled={!authReady} onClick={() => void practice.resume()}><Play size={22} weight="fill" /> 继续练习</button><button className="outline-button" onClick={() => resetPractice()}>重新开始</button></> : <button className="primary-button start-button" onClick={phase === 'finished' ? () => resetPractice() : () => void practice.start()} disabled={locked || !validDuration || !authReady}>{phase === 'starting' || !authReady ? '准备中…' : phase === 'restoring' ? '恢复进度中…' : phase === 'pausing' ? '正在暂停…' : phase === 'resuming' ? '正在继续…' : phase === 'finishing' ? '正在结算…' : phase === 'finished' ? '再练一次' : <><Play size={22} weight="fill" /> 开始练习</>}</button>}
-          </div>
-          <p className="helper-text" role="status">{!validDuration ? '请输入 1–60 分钟的整数。' : feedback || practice.feedback || (phase === 'paused' ? '练习已暂停，暂停时间不计入成绩。' : '选好文章和时间；打完当前文章或时间到时显示结果。')}</p>
+          {practiceNotice && <p className="practice-notice" role="status">{practiceNotice}</p>}
         </>}
-        {view === 'rankings' && <section className="content-panel"><div className="content-heading"><div><h1><Trophy size={26} /> 排行榜</h1><p>同语言、同难度和同一时长的成绩一起比较。</p></div><span className="count-chip">前 100 名</span></div>{feedback && <p className="form-error">{feedback}</p>}{loading ? <p className="empty-state">正在寻找星星般的成绩…</p> : rankings.length === 0 ? <p className="empty-state">还没有成绩，来留下第一个脚印吧。</p> : <ol className="ranking-list">{rankings.map((entry, index) => <li key={`${entry.attemptId}-${index}`}><span className={`rank-number rank-${index + 1}`}>{index < 3 ? <Crown size={21} weight="fill" /> : index + 1}</span><span className="rank-name">{entry.nickname} {entry.guest ? <small>游客</small> : null}</span><span className="rank-accuracy">准确率 {entry.accuracy}%</span><strong>{entry.speed} <small>{language === 'zh' ? '字/分' : 'WPM'}</small></strong>{user?.isAdmin && <button className="text-button" onClick={() => void removeScore(entry.attemptId)}>下架</button>}</li>)}</ol>}</section>}
-        {view === 'history' && <section className="content-panel"><div className="content-heading"><div><h1><Clock size={26} /> 我的记录</h1><p>{user ? '账号成绩与本机未同步记录都会显示在这里。' : '游客记录保存在当前浏览器中。'}</p></div>{!user && <button className="outline-button" onClick={() => setShowAuth(true)}>登录同步</button>}</div>{feedback && <p className="form-error">{feedback}</p>}{loading ? <p className="empty-state">正在加载…</p> : history.length === 0 ? <p className="empty-state">还没有练习记录，开始一段轻松的打字时光吧。</p> : <ul className="history-list">{history.map((entry, index) => <li key={`${entry.finishedAt}-${index}`}><span><strong>{languageNames[entry.language]} · {difficultyNames[entry.difficulty]}</strong><small>{formatDate(entry.finishedAt)} · 限时 {entry.duration / 60} 分钟{entry.elapsedMs != null ? ` · 用时 ${formatTime(entry.elapsedMs)}` : ''}</small>{entry.localOnly && <small>本机未同步</small>}</span><span>{entry.speed} {entry.language === 'zh' ? '字/分' : 'WPM'}<small>准确率 {entry.accuracy}% · 错误 {entry.errors ?? 0} · 退格 {entry.backspaces ?? 0}</small></span></li>)}</ul>}</section>}
-        {view === 'admin' && <section className="content-panel"><div className="content-heading"><div><h1><Sparkle size={26} /> 成绩复核</h1><p>检查被标记的成绩；通过后才会进入排行榜。</p></div></div>{feedback && <p className="form-error">{feedback}</p>}{review.length === 0 ? <p className="empty-state">目前没有待复核的成绩。</p> : <ul className="history-list">{review.map((entry) => <li key={entry.id}><span><strong>{entry.nickname} · {languageNames[entry.language]} {difficultyNames[entry.difficulty]}</strong><small>{entry.duration}秒 · {entry.speed} · 准确率 {entry.accuracy}% · 进度记录 {entry.checkpoints} 次</small><small>复核原因：{entry.reasons.map((reason) => reviewReasonNames[reason] || reason).join('、') || '人工标记'}</small></span><span className="review-actions"><button className="text-button" onClick={() => void reviewAction(entry.id, 'approve')}>通过</button><button className="text-button" onClick={() => void reviewAction(entry.id, 'reject')}>拒绝</button></span></li>)}</ul>}</section>}
+        {view !== 'practice' && feedback && <p className="form-error view-error" role="alert">{feedback}</p>}
+        {historyError && recordViews.includes(view) && <p className="form-error view-error" role="status">连接失败，显示本机记录。</p>}
+        {view === 'library' && <ArticleLibrary articles={catalog} favorites={workspace.favorites} onToggleFavorite={(id) => void workspace.toggleFavorite(id).catch(reportSaveError)} onSelect={selectArticle} onSave={(article) => workspace.put('article', article.id, article)} onDelete={(id) => workspace.remove('article', id)} />}
+        {view === 'rankings' && <RankingView initial={{ language, difficulty, duration, mode: currentMode, strict: currentStrict }} articles={builtIns} isAdmin={!!user?.isAdmin} ownerId={ownerId} />}
+        {view === 'history' && <RecordsView records={records} onReplay={selectArticle} onContinue={continueRecord} />}
+        {view === 'drafts' && <DraftsView drafts={draftBox.drafts} onResume={(draft) => continueDraft(draft)} onDelete={deleteDraft}
+          recovery={draftBox.completed.map((draft) => ({
+            id: draft.recordId, title: draft.title, savedAt: draft.savedAt,
+            recover: () => void afterPark(() => {
+              setShowResult(false);
+              setFeedback('');
+              setSelection(legacyArticle(draft));
+              setPendingLoad({ legacy: draft });
+              setView('practice');
+            }),
+          }))}
+        />}
+        {view === 'mistakes' && <MistakesView records={records} onPractice={selectArticle} />}
+        {view === 'stats' && <StatsView records={records} />}
+        {view === 'admin' && user?.isAdmin && <section className="content-panel">
+          <div className="content-heading"><h1><Sparkle size={26} /> 成绩复核</h1></div>
+          {review.length === 0 ? <p className="empty-state">暂无待审核成绩</p> : <ul className="history-list">{review.map((entry) => <li key={entry.id}>
+            <span><strong>{entry.nickname} · {languageNames[entry.language]} {difficultyNames[entry.difficulty]}</strong><small>{entry.duration}秒 · {entry.speed} · 准确率 {entry.accuracy}% · 进度记录 {entry.checkpoints} 次</small><small>复核原因：{entry.reasons.map((reason) => reviewReasonNames[reason] || reason).join('、') || '人工标记'}</small></span>
+            <span className="review-actions"><button className="text-button" onClick={() => void reviewAction(entry.id, 'approve')}>通过</button><button className="text-button" onClick={() => void reviewAction(entry.id, 'reject')}>拒绝</button></span>
+          </li>)}</ul>}
+        </section>}
       </div>
       <img className="sleeping-cat" src="/assets/sleeping-cat.png" alt="" aria-hidden="true" />
     </main>
-    {showCustom && <Dialog title="自定义练习文字" onClose={() => setShowCustom(false)}><p className="dialog-intro">粘贴或输入想练习的内容，当前语言和难度仍可用于分类。自定义文字仅作本地练习。</p><label className="custom-editor">练习文字<textarea aria-label="自定义文章内容" value={customDraft} maxLength={20000} onChange={(event) => setCustomDraft(event.target.value)} placeholder="在这里输入或粘贴文章…" /></label>{customError && <p className="form-error" role="alert">{customError}</p>}<div className="result-actions"><span className="custom-count">{splitCharacters(customDraft).length} / 20000 字符</span><button className="primary-button" onClick={useCustomText}>使用这段文字</button></div></Dialog>}
-    {showAuth && <AuthDialog onClose={() => setShowAuth(false)} onLogin={setUser} />}
-    {showResult && result && <Dialog title="练习完成！" onClose={() => setShowResult(false)}>
-      <p className="dialog-intro">{result.offline ? '这次是本地练习，成绩已保存在当前浏览器。' : '每一次练习，都是向前的一小步。'}</p>
-      <div className="result-metrics"><div><strong>{result.language === 'zh' ? result.score.cpm : result.score.wpm}</strong><span>{result.language === 'zh' ? '字 / 分钟' : 'WPM'}</span></div><div><strong>{result.score.accuracy}%</strong><span>准确率</span></div><div><strong>{result.score.total} / {result.articleTotal}</strong><span>已打 / 文章字数</span></div><div><strong>{result.errors}</strong><span>错误字数</span></div><div><strong>{result.backspaces}</strong><span>退格次数</span></div><div><strong>{formatTime(result.elapsedMs)}</strong><span>有效用时</span></div></div>
-      {!result.offline && result.eligible && !rankSubmitted && <div className="rank-submit">{!user && <label>上榜昵称<input value={nickname} maxLength={32} onChange={(event) => setNickname(event.target.value)} placeholder="给自己取个昵称" /></label>}<button className="primary-button" disabled={busy || (!user && !nickname.trim())} onClick={() => void submitRank()}><Trophy size={20} /> {busy ? '提交中…' : '提交到排行榜'}</button></div>}
+    {showCustom && <Dialog title="自定义练习文字" onClose={() => setShowCustom(false)}>
+      <label className="custom-editor">练习文字<textarea aria-label="自定义文章内容" value={customDraft} maxLength={20000} onChange={(event) => setCustomDraft(event.target.value)} /></label>
+      {customError && <p className="form-error" role="alert">{customError}</p>}
+      <div className="result-actions"><span className="custom-count">{splitCharacters(customDraft).length} / 20000 字符</span><button className="primary-button" onClick={useCustomText}>使用这段文字</button></div>
+    </Dialog>}
+    {showAuth && <AuthDialog onClose={() => setShowAuth(false)} onLogin={onUser} />}
+    {showSettings && <SettingsDialog settings={{ ...workspace.settings, minutes: locked ? currentDuration / 60 : duration / 60, mode: locked ? currentMode : workspace.settings.mode, strict: locked ? currentStrict : workspace.settings.strict }} onChange={updateSettings} locked={locked} onClose={() => setShowSettings(false)} onFocus={enterFocus} focused={focused} syncState={workspace.syncState} onSync={() => void workspace.sync()} isSignedIn={!!user} />}
+    {confirmPractice && <Dialog title={confirmPractice.action === 'restart' ? '重新开始本次练习？' : '结束本次练习？'} onClose={cancelPracticeAction}>
+      {confirmPractice.action === 'restart' && <p className="dialog-intro">本次输入和计时将被清除。</p>}
+      {phase === 'restoring' && <p className="dialog-intro" role="status">恢复中…</p>}
+      <div className="result-actions">
+        <button className="outline-button" disabled={phase !== 'paused'} onClick={cancelPracticeAction}>继续当前练习</button>
+        <button className="primary-button" disabled={phase !== 'paused'} onClick={() => {
+          const action = confirmPractice.action;
+          setConfirmPractice(null);
+          if (action === 'restart') resetPractice(catalog.find((article) => article.id === selection.id) ?? selection);
+          else void practice.finish();
+        }}>{confirmPractice.action === 'restart' ? '确认重新开始' : '结束并查看成绩'}</button>
+      </div>
+    </Dialog>}
+    {showResult && result && <Dialog title="练习成绩" onClose={() => setShowResult(false)}>
+      {result.offline && <p className="dialog-intro">{!result.custom && result.elapsedMs < 1000 ? (user ? '用时不足 1 秒，不参与排行' : '用时不足 1 秒，仅本机保存') : user ? '个人成绩' : '仅本机保存'}</p>}
+      <div className="result-metrics">
+        <div><strong>{result.language === 'zh' ? result.score.cpm : result.score.wpm}</strong><span>{result.language === 'zh' ? '字 / 分钟' : 'WPM'}</span></div>
+        <div><strong>{result.score.accuracy}%</strong><span>准确率</span></div>
+        <div><strong>{typedCharacters.length} / {result.articleTotal}</strong><span>已打 / 文章字数</span>{practice.offset > 0 && <small>本轮 {result.score.total} 字</small>}</div>
+        <div><strong>{result.errors}</strong><span>错误字数</span></div>
+        <div><strong>{result.backspaces}</strong><span>退格次数</span></div>
+        <div><strong>{formatTime(result.elapsedMs)}</strong><span>有效用时</span></div>
+      </div>
+      {mistakes.length > 0 && <details className="mistake-review"><summary>错字回看 · {mistakes.length > 30 ? `前 30 / ${mistakes.length}` : mistakes.length} 处</summary><ul>{mistakes.slice(0, 30).map((mistake) => <li key={mistake.index}><span>第 {mistake.index + 1} 字</span><span>原文 <b>{readableCharacter(mistake.expected)}</b></span><span>输入 <del>{readableCharacter(mistake.actual)}</del></span></li>)}</ul></details>}
+      {!result.offline && result.eligible && !rankSubmitted && <div className="rank-submit">
+        {!user && <label>上榜昵称<input value={nickname} maxLength={32} onChange={(event) => setNickname(event.target.value)} /></label>}
+        <button className="primary-button" disabled={busy || (!user && !nickname.trim())} onClick={() => void submitRank()}><Trophy size={20} /> {busy ? '提交中…' : '提交到排行榜'}</button>
+      </div>}
       {rankMessage && <p className={rankSubmitted ? 'form-notice' : 'form-error'} role={rankSubmitted ? 'status' : 'alert'}>{rankSubmitted && <CheckCircle size={18} />} {rankMessage}</p>}
-      <div className="result-actions"><button className="outline-button" onClick={() => { setShowResult(false); resetPractice(); }}>再练一次</button><button className="text-button" onClick={() => { setShowResult(false); navigate('rankings'); }}>查看排行榜</button></div>
+      <div className={`result-actions result-navigation${result.continuation ? ' with-continuation' : ''}`}>
+        {result.continuation && <button className="primary-button" onClick={() => continueDraft(result.continuation!)}>继续本篇</button>}
+        <button className="outline-button" onClick={() => resetPractice(selection, true)}>再练一次</button>
+        {!focused && <button className="text-button" onClick={nextArticle}>下一篇 <ArrowRight size={16} aria-hidden="true" /></button>}
+        {!focused && <button className="text-button" onClick={() => navigate('rankings')}>排行榜</button>}
+      </div>
     </Dialog>}
   </div>;
 }

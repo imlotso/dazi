@@ -23,7 +23,7 @@ test('selects language and difficulty and validates the 1–60 minute limit', as
   await expect(article.locator('option')).toHaveCount(7);
   await expect(article).toHaveValue('en-advanced-1');
   await article.selectOption('en-advanced-2');
-  await expect(page.getByLabel('当前文章：A Bridge Between Banks')).toBeVisible();
+  await expect(page.getByLabel('当前文章：An Ideal Family')).toBeVisible();
   await expect(page.getByTestId('remaining-time')).toHaveText('01:00');
 });
 
@@ -54,9 +54,9 @@ test('keeps confirmed text, mistakes and backspaces across pause and reload', as
   const startResponse = await started;
   expect(startResponse.status()).toBe(200);
   const { id } = await startResponse.json();
-  const input = page.getByRole('textbox', { name: /在此输入上方文章/ });
+  const input = page.getByRole('textbox', { name: /当前行输入/ });
   await expect(input).toBeEnabled();
-  await input.fill('清晨的阳错');
+  await input.fill('我与父亲错');
   await expect(page.getByTestId('typed-count')).toHaveText('5');
   await expect(page.getByTestId('error-count')).toHaveText('1');
   await input.press('Backspace');
@@ -71,7 +71,7 @@ test('keeps confirmed text, mistakes and backspaces across pause and reload', as
   await page.reload();
   expect((await restored).status()).toBe(200);
   await expect(page.getByRole('button', { name: '继续练习' })).toBeEnabled();
-  await expect(input).toHaveValue('清晨的阳');
+  await expect(input).toHaveValue('我与父亲');
   await expect(page.getByTestId('backspace-count')).toHaveText('1');
   await expect(page.getByTestId('remaining-time')).toHaveText(remaining!);
   const resumed = page.waitForResponse((response) => response.url().endsWith(`/api/tests/${id}/resume`) && response.request().method() === 'POST');
@@ -83,14 +83,14 @@ test('keeps confirmed text, mistakes and backspaces across pause and reload', as
 test('counts simulated Chinese composition only after confirmation', async ({ page }) => {
   await page.goto('/');
   await page.getByRole('button', { name: '开始练习' }).click();
-  const input = page.getByRole('textbox', { name: /在此输入上方文章/ });
+  const input = page.getByRole('textbox', { name: /当前行输入/ });
   await expect(input).toBeEnabled();
   await input.dispatchEvent('compositionstart', { data: '' });
-  await input.fill('清晨');
+  await input.fill('我与');
   await expect(page.getByTestId('typed-count')).toHaveText('0');
   await input.press('Backspace');
   await expect(page.getByTestId('backspace-count')).toHaveText('0');
-  await input.dispatchEvent('compositionend', { data: '清' });
+  await input.dispatchEvent('compositionend', { data: '我' });
   await expect(page.getByTestId('typed-count')).toHaveText('1');
 });
 
@@ -100,10 +100,10 @@ test('shows a result immediately when a custom article is completed', async ({ p
   await page.getByRole('textbox', { name: '自定义文章内容' }).fill('你好世界');
   await page.getByRole('button', { name: '使用这段文字' }).click();
   await page.getByRole('button', { name: '开始练习' }).click();
-  const input = page.getByRole('textbox', { name: /在此输入上方文章/ });
+  const input = page.getByRole('textbox', { name: /当前行输入/ });
   await expect(input).toBeEnabled();
   await input.fill('你好世界');
-  const result = page.getByRole('dialog', { name: '练习完成！' });
+  const result = page.getByRole('dialog', { name: '练习成绩' });
   await expect(result).toBeVisible();
   await expect(result.getByText('4 / 4')).toBeVisible();
   await expect(result.getByText('100%')).toBeVisible();
@@ -111,7 +111,7 @@ test('shows a result immediately when a custom article is completed', async ({ p
 
 test('submits an online result, registers an admin with a test email and publishes the reviewed score', async ({ page }) => {
   await page.goto('/');
-  const target = await page.getByLabel('当前文章：清晨的光').textContent();
+  const target = await page.locator('.line-source').evaluateAll((lines) => lines.map((line) => line.getAttribute('data-text')).join(''));
   expect(target).toBeTruthy();
   const started = page.waitForResponse((response) => response.url().endsWith('/api/tests/start') && response.request().method() === 'POST');
   await page.getByRole('button', { name: '开始练习' }).click();
@@ -123,27 +123,27 @@ test('submits an online result, registers an admin with a test email and publish
     return minutes * 60 + seconds;
   }, { timeout: 10_000 }).toBeLessThanOrEqual(298);
   const finished = page.waitForResponse((response) => response.url().endsWith(`/api/tests/${id}/finish`) && response.request().method() === 'POST');
-  await page.getByRole('textbox', { name: /在此输入上方文章/ }).fill(target!);
+  await page.getByRole('textbox', { name: /当前行输入/ }).fill(target!);
   const finishResponse = await finished;
   expect(finishResponse.status()).toBe(200);
   const finishData = await finishResponse.json();
   const total = [...new Intl.Segmenter(undefined, { granularity: 'grapheme' }).segment(target!)].length;
   const expectedSpeed = Math.round(total * 60_000 / finishData.elapsedMs * 100) / 100;
   expect(finishData.score).toMatchObject({ correct: total, total, accuracy: 100, cpm: expectedSpeed });
-  const result = page.getByRole('dialog', { name: '练习完成！' });
+  const result = page.getByRole('dialog', { name: '练习成绩' });
   await expect(result.getByText(`${total} / ${total}`)).toBeVisible();
   await expect(result.locator('.result-metrics > div').first().locator('strong')).toHaveText(String(expectedSpeed));
   await result.getByRole('textbox', { name: '上榜昵称' }).fill('CI 访客');
   const submitted = page.waitForResponse((response) => response.url().endsWith('/api/leaderboard') && response.request().method() === 'POST');
   await result.getByRole('button', { name: '提交到排行榜' }).click();
   expect((await submitted).status()).toBe(200);
-  await expect(result.getByText('成绩已提交，正在等待复核。')).toBeVisible();
+  await expect(result.getByText('已提交，待复核。')).toBeVisible();
   const rankingLoaded = page.waitForResponse((response) => response.url().includes('/api/leaderboard?') && response.request().method() === 'GET');
-  await result.getByRole('button', { name: '查看排行榜' }).click();
+  await result.getByRole('button', { name: '排行榜', exact: true }).click();
   const beforeReview = await rankingLoaded;
   expect(beforeReview.status()).toBe(200);
   expect((await beforeReview.json()).entries.some((entry: { nickname: string }) => entry.nickname === 'CI 访客')).toBe(false);
-  await expect(page.getByText('还没有成绩，来留下第一个脚印吧。')).toBeVisible();
+  await expect(page.getByText('暂无成绩')).toBeVisible();
   await expect(page.getByText('CI 访客')).toHaveCount(0);
 
   await page.getByRole('button', { name: '登录', exact: true }).click();
@@ -157,7 +157,7 @@ test('submits an online result, registers an admin with a test email and publish
   expect((await emailSent).status()).toBe(200);
   const email = await page.request.get('/__e2e__/email-code?email=admin%40example.test&purpose=register');
   expect(email.status()).toBe(200);
-  await registration.getByPlaceholder('6 位验证码').fill((await email.json()).code);
+  await registration.getByRole('textbox', { name: '邮箱验证码', exact: true }).fill((await email.json()).code);
   await registration.getByRole('button', { name: '注册并登录' }).click();
   await expect(page.getByTitle('退出登录')).toContainText('ci_admin');
   const loggedOut = page.waitForResponse((response) => response.url().endsWith('/api/auth/logout') && response.request().method() === 'POST');
@@ -165,7 +165,7 @@ test('submits an online result, registers an admin with a test email and publish
   expect((await loggedOut).status()).toBe(200);
   expect((await (await page.request.get('/api/me')).json()).user).toBeNull();
   await page.getByRole('button', { name: '登录', exact: true }).click();
-  const login = page.getByRole('dialog', { name: '欢迎回来' });
+  const login = page.getByRole('dialog', { name: '登录' });
   await login.getByLabel('用户名或邮箱').fill('admin@example.test');
   await login.getByLabel('密码', { exact: true }).fill('ci-password-123');
   const loggedIn = page.waitForResponse((response) => response.url().endsWith('/api/auth/login') && response.request().method() === 'POST');
