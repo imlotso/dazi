@@ -1,6 +1,8 @@
 # Prototype Instructions
 
-Product direction: preserve the selected soft blue and lavender cloud-room anime aesthetic. Keep practice passages comfortable to read instead of using oversized central text. Maintain separate Chinese and English article collections with at least 20 passages per language across beginner, intermediate, and advanced stages.
+Product direction: preserve the selected soft blue and lavender cloud-room anime aesthetic. Keep practice passages comfortable to read instead of using oversized central text. Maintain separate Chinese and English article collections with at least 20 passages per language across beginner, intermediate, and advanced stages. Provide a switchable, readable night mode that preserves the same visual identity.
+
+Practice must default to five minutes, accept whole-minute durations from 1 through 60, and finish immediately when the selected article is fully entered. Preserve unfinished progress locally, support pause and resume, handle Chinese IME composition correctly, calculate speed from active time, and display article length, entered characters, errors, and backspace count.
 
 Run the local server yourself and open the preview in the browser available to this environment. Do not give the user server-start instructions when you can run it.
 

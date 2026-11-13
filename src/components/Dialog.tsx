@@ -1,5 +1,5 @@
 import { useEffect, useRef, type ReactNode } from 'react';
-import { X } from '@phosphor-icons/react';
+import { X } from '@phosphor-icons/react/X';
 
 export function Dialog({ title, onClose, children }: { title: string; onClose: () => void; children: ReactNode }) {
   const dialog = useRef<HTMLDivElement>(null);

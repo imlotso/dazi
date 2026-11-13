@@ -5,6 +5,12 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="theme-color" content="#fbf8fa" />
     <meta name="description" content="在轻松的云朵小屋里，练习中文与英文打字。" />
+    <script>
+      try {
+        const savedTheme = localStorage.getItem('cloudtyping.theme.v1');
+        document.documentElement.dataset.theme = savedTheme === 'light' || savedTheme === 'dark' ? savedTheme : (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+      } catch { document.documentElement.dataset.theme = 'light'; }
+    </script>
     <title>云打字练习 · 中英文打字测试</title>
   </head>
   <body>

@@ -38,6 +38,7 @@ const app = await createApp({
   codeSecret,
   adminEmail: process.env.ADMIN_EMAIL,
   staticRoot: production ? resolve('dist/client') : undefined,
+  trustProxy: process.env.TRUST_PROXY === 'true',
   mailer,
 });
 const port = Number(process.env.PORT || 3001);

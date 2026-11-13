@@ -21,4 +21,14 @@ describe('built-in article library', () => {
       expect(article.content.length).toBeGreaterThanOrEqual(article.language === 'zh' ? 80 : 180);
     }
   });
+
+  it('provides substantial passages with length increasing by stage', () => {
+    const minimumZh = { beginner: 120, intermediate: 180, advanced: 220 };
+    const minimumEn = { beginner: 100, intermediate: 140, advanced: 180 };
+    for (const article of articles) {
+      const count = article.language === 'zh' ? (article.content.match(/\p{Script=Han}/gu) || []).length : article.content.trim().split(/\s+/).length;
+      expect(count).toBeGreaterThanOrEqual(article.language === 'zh' ? minimumZh[article.difficulty] : minimumEn[article.difficulty]);
+      if (article.language === 'en') expect(article.content).toMatch(/^[\x20-\x7e]+$/);
+    }
+  });
 });

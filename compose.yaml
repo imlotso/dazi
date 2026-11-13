@@ -4,6 +4,7 @@ services:
     restart: unless-stopped
     environment:
       CODE_SECRET: ${CODE_SECRET:?请在 .env 中配置至少 32 位的 CODE_SECRET}
+      TRUST_PROXY: "true"
       ADMIN_EMAIL: ${ADMIN_EMAIL:-}
       SMTP_HOST: ${SMTP_HOST:-}
       SMTP_PORT: ${SMTP_PORT:-587}
