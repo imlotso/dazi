@@ -28,6 +28,17 @@ npm run build
 npm run test:sites
 ```
 
+PR 和 `main` 的 CI 还会运行 Chromium 端到端测试，以及 Docker 容器替换、数据卷持久化和 SQLite 备份恢复检查。本地运行这些检查需要先构建项目，并安装 Playwright 的 Chromium：
+
+```bash
+PLAYWRIGHT_SKIP_BROWSER_GC=1 npx playwright install chromium
+npm run test:e2e
+docker build -t dazi-ci:local .
+npm run test:docker
+```
+
+浏览器测试模拟输入法组合事件，账号流程使用测试邮箱；它们不能替代真实操作系统输入法、SMTP 投递和公网 HTTPS 的实机验证。
+
 ## Docker Compose 部署
 
 准备一台已安装 Docker 和 Compose 的服务器，并将域名解析到服务器，开放 80 和 443 端口。内地服务器请按服务商要求完成备案。Caddy 在域名和端口可用时自动申请 HTTPS 证书。

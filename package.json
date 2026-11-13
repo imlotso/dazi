@@ -11,7 +11,9 @@
     "start": "node dist/server/app.js",
     "test": "vitest run --exclude tests/sites-worker.test.mjs",
     "typecheck": "tsc --noEmit",
-    "test:sites": "node --test tests/sites-worker.test.mjs"
+    "test:sites": "node --test tests/sites-worker.test.mjs",
+    "test:e2e": "playwright test",
+    "test:docker": "node scripts/ci-docker-smoke.mjs"
   },
   "dependencies": {
     "@fastify/cookie": "^11.1.5",
@@ -27,6 +29,7 @@
     "zod": "^4.6.7"
   },
   "devDependencies": {
+    "@playwright/test": "^1.65.0",
     "@tailwindcss/vite": "^4.3.5",
     "@testing-library/react": "^16.3.3",
     "@testing-library/user-event": "^14.6.10",

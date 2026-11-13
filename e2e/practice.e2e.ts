@@ -1,0 +1,186 @@
+import { expect, test } from '@playwright/test';
+
+test('selects language and difficulty and validates the 1–60 minute limit', async ({ page }) => {
+  await page.goto('/');
+  const minutes = page.getByRole('spinbutton', { name: '测试时间（分钟）' });
+  const start = page.getByRole('button', { name: '开始练习' });
+  await expect(start).toBeEnabled();
+  await expect(minutes).toHaveValue('5');
+  await minutes.fill('0');
+  await expect(start).toBeDisabled();
+  await minutes.fill('61');
+  await expect(start).toBeDisabled();
+  await minutes.fill('1.5');
+  await expect(start).toBeDisabled();
+  await minutes.fill('60');
+  await expect(start).toBeEnabled();
+  await expect(page.getByTestId('remaining-time')).toHaveText('60:00');
+  await minutes.fill('1');
+  await expect(start).toBeEnabled();
+  await page.getByRole('button', { name: 'English' }).click();
+  await page.getByRole('button', { name: '挑战' }).click();
+  const article = page.getByLabel('选择练习文章');
+  await expect(article.locator('option')).toHaveCount(7);
+  await expect(article).toHaveValue('en-advanced-1');
+  await article.selectOption('en-advanced-2');
+  await expect(page.getByLabel('当前文章：A Bridge Between Banks')).toBeVisible();
+  await expect(page.getByTestId('remaining-time')).toHaveText('01:00');
+});
+
+test('keeps the chosen night theme after reloading', async ({ page }) => {
+  await page.goto('/');
+  await page.getByRole('button', { name: '切换至夜间模式' }).click();
+  await expect(page.locator('html')).toHaveAttribute('data-theme', 'dark');
+  await page.reload();
+  await expect(page.getByRole('button', { name: '切换至日间模式' })).toBeVisible();
+  await expect(page.locator('html')).toHaveAttribute('data-theme', 'dark');
+});
+
+test('keeps the main controls accessible on a small phone', async ({ page }) => {
+  await page.setViewportSize({ width: 375, height: 812 });
+  await page.goto('/');
+  await expect(page.getByRole('button', { name: '登录', exact: true })).toBeInViewport();
+  await expect(page.getByRole('spinbutton', { name: '测试时间（分钟）' })).toBeInViewport();
+  await expect(page.getByRole('button', { name: '自定义文字' })).toBeInViewport();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(375);
+  await page.getByRole('button', { name: '切换至夜间模式' }).click();
+  await expect(page.locator('html')).toHaveAttribute('data-theme', 'dark');
+});
+
+test('keeps confirmed text, mistakes and backspaces across pause and reload', async ({ page }) => {
+  await page.goto('/');
+  const started = page.waitForResponse((response) => response.url().endsWith('/api/tests/start') && response.request().method() === 'POST');
+  await page.getByRole('button', { name: '开始练习' }).click();
+  const startResponse = await started;
+  expect(startResponse.status()).toBe(200);
+  const { id } = await startResponse.json();
+  const input = page.getByRole('textbox', { name: /在此输入上方文章/ });
+  await expect(input).toBeEnabled();
+  await input.fill('清晨的阳错');
+  await expect(page.getByTestId('typed-count')).toHaveText('5');
+  await expect(page.getByTestId('error-count')).toHaveText('1');
+  await input.press('Backspace');
+  await expect(page.getByTestId('backspace-count')).toHaveText('1');
+  await expect(page.getByTestId('error-count')).toHaveText('0');
+  const paused = page.waitForResponse((response) => response.url().endsWith(`/api/tests/${id}/pause`) && response.request().method() === 'POST');
+  await page.getByRole('button', { name: '暂停练习' }).click();
+  expect((await paused).status()).toBe(200);
+  await expect(page.getByRole('button', { name: '继续练习' })).toBeEnabled();
+  const remaining = await page.getByTestId('remaining-time').textContent();
+  const restored = page.waitForResponse((response) => response.url().endsWith(`/api/tests/${id}/pause`) && response.request().method() === 'POST');
+  await page.reload();
+  expect((await restored).status()).toBe(200);
+  await expect(page.getByRole('button', { name: '继续练习' })).toBeEnabled();
+  await expect(input).toHaveValue('清晨的阳');
+  await expect(page.getByTestId('backspace-count')).toHaveText('1');
+  await expect(page.getByTestId('remaining-time')).toHaveText(remaining!);
+  const resumed = page.waitForResponse((response) => response.url().endsWith(`/api/tests/${id}/resume`) && response.request().method() === 'POST');
+  await page.getByRole('button', { name: '继续练习' }).click();
+  expect((await resumed).status()).toBe(200);
+  await expect(input).toBeEnabled();
+});
+
+test('counts simulated Chinese composition only after confirmation', async ({ page }) => {
+  await page.goto('/');
+  await page.getByRole('button', { name: '开始练习' }).click();
+  const input = page.getByRole('textbox', { name: /在此输入上方文章/ });
+  await expect(input).toBeEnabled();
+  await input.dispatchEvent('compositionstart', { data: '' });
+  await input.fill('清晨');
+  await expect(page.getByTestId('typed-count')).toHaveText('0');
+  await input.press('Backspace');
+  await expect(page.getByTestId('backspace-count')).toHaveText('0');
+  await input.dispatchEvent('compositionend', { data: '清' });
+  await expect(page.getByTestId('typed-count')).toHaveText('1');
+});
+
+test('shows a result immediately when a custom article is completed', async ({ page }) => {
+  await page.goto('/');
+  await page.getByRole('button', { name: '自定义文字' }).click();
+  await page.getByRole('textbox', { name: '自定义文章内容' }).fill('你好世界');
+  await page.getByRole('button', { name: '使用这段文字' }).click();
+  await page.getByRole('button', { name: '开始练习' }).click();
+  const input = page.getByRole('textbox', { name: /在此输入上方文章/ });
+  await expect(input).toBeEnabled();
+  await input.fill('你好世界');
+  const result = page.getByRole('dialog', { name: '练习完成！' });
+  await expect(result).toBeVisible();
+  await expect(result.getByText('4 / 4')).toBeVisible();
+  await expect(result.getByText('100%')).toBeVisible();
+});
+
+test('submits an online result, registers an admin with a test email and publishes the reviewed score', async ({ page }) => {
+  await page.goto('/');
+  const target = await page.getByLabel('当前文章：清晨的光').textContent();
+  expect(target).toBeTruthy();
+  const started = page.waitForResponse((response) => response.url().endsWith('/api/tests/start') && response.request().method() === 'POST');
+  await page.getByRole('button', { name: '开始练习' }).click();
+  const startResponse = await started;
+  expect(startResponse.status()).toBe(200);
+  const { id } = await startResponse.json();
+  await expect.poll(async () => {
+    const [minutes, seconds] = (await page.getByTestId('remaining-time').textContent() || '05:00').split(':').map(Number);
+    return minutes * 60 + seconds;
+  }, { timeout: 10_000 }).toBeLessThanOrEqual(298);
+  const finished = page.waitForResponse((response) => response.url().endsWith(`/api/tests/${id}/finish`) && response.request().method() === 'POST');
+  await page.getByRole('textbox', { name: /在此输入上方文章/ }).fill(target!);
+  const finishResponse = await finished;
+  expect(finishResponse.status()).toBe(200);
+  const finishData = await finishResponse.json();
+  const total = [...new Intl.Segmenter(undefined, { granularity: 'grapheme' }).segment(target!)].length;
+  const expectedSpeed = Math.round(total * 60_000 / finishData.elapsedMs * 100) / 100;
+  expect(finishData.score).toMatchObject({ correct: total, total, accuracy: 100, cpm: expectedSpeed });
+  const result = page.getByRole('dialog', { name: '练习完成！' });
+  await expect(result.getByText(`${total} / ${total}`)).toBeVisible();
+  await expect(result.locator('.result-metrics > div').first().locator('strong')).toHaveText(String(expectedSpeed));
+  await result.getByRole('textbox', { name: '上榜昵称' }).fill('CI 访客');
+  const submitted = page.waitForResponse((response) => response.url().endsWith('/api/leaderboard') && response.request().method() === 'POST');
+  await result.getByRole('button', { name: '提交到排行榜' }).click();
+  expect((await submitted).status()).toBe(200);
+  await expect(result.getByText('成绩已提交，正在等待复核。')).toBeVisible();
+  const rankingLoaded = page.waitForResponse((response) => response.url().includes('/api/leaderboard?') && response.request().method() === 'GET');
+  await result.getByRole('button', { name: '查看排行榜' }).click();
+  const beforeReview = await rankingLoaded;
+  expect(beforeReview.status()).toBe(200);
+  expect((await beforeReview.json()).entries.some((entry: { nickname: string }) => entry.nickname === 'CI 访客')).toBe(false);
+  await expect(page.getByText('还没有成绩，来留下第一个脚印吧。')).toBeVisible();
+  await expect(page.getByText('CI 访客')).toHaveCount(0);
+
+  await page.getByRole('button', { name: '登录', exact: true }).click();
+  await page.getByRole('button', { name: '创建账号' }).click();
+  const registration = page.getByRole('dialog', { name: '创建账号' });
+  await registration.getByLabel('用户名', { exact: true }).fill('ci_admin');
+  await registration.getByLabel('邮箱', { exact: true }).fill('admin@example.test');
+  await registration.getByLabel('密码', { exact: true }).fill('ci-password-123');
+  const emailSent = page.waitForResponse((response) => response.url().endsWith('/api/auth/code') && response.request().method() === 'POST');
+  await registration.getByRole('button', { name: '获取验证码' }).click();
+  expect((await emailSent).status()).toBe(200);
+  const email = await page.request.get('/__e2e__/email-code?email=admin%40example.test&purpose=register');
+  expect(email.status()).toBe(200);
+  await registration.getByPlaceholder('6 位验证码').fill((await email.json()).code);
+  await registration.getByRole('button', { name: '注册并登录' }).click();
+  await expect(page.getByTitle('退出登录')).toContainText('ci_admin');
+  const loggedOut = page.waitForResponse((response) => response.url().endsWith('/api/auth/logout') && response.request().method() === 'POST');
+  await page.getByTitle('退出登录').click();
+  expect((await loggedOut).status()).toBe(200);
+  expect((await (await page.request.get('/api/me')).json()).user).toBeNull();
+  await page.getByRole('button', { name: '登录', exact: true }).click();
+  const login = page.getByRole('dialog', { name: '欢迎回来' });
+  await login.getByLabel('用户名或邮箱').fill('admin@example.test');
+  await login.getByLabel('密码', { exact: true }).fill('ci-password-123');
+  const loggedIn = page.waitForResponse((response) => response.url().endsWith('/api/auth/login') && response.request().method() === 'POST');
+  await login.getByRole('button', { name: '登录', exact: true }).click();
+  expect((await loggedIn).status()).toBe(200);
+  await page.reload();
+  await expect(page.getByTitle('退出登录')).toContainText('ci_admin');
+
+  await page.getByRole('button', { name: '审核', exact: true }).click();
+  const row = page.locator('li').filter({ hasText: 'CI 访客' });
+  await expect(row).toBeVisible();
+  await row.getByRole('button', { name: '通过' }).click();
+  await expect(row).toHaveCount(0);
+  await page.getByRole('button', { name: '排行榜', exact: true }).click();
+  const ranked = page.locator('li').filter({ hasText: 'CI 访客' });
+  await expect(ranked.locator('strong')).toHaveText(`${expectedSpeed} 字/分`);
+  await expect(ranked).toContainText('100%');
+});
