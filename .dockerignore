@@ -4,5 +4,7 @@ dist
 .git
 .env
 coverage
+test-results
+playwright-report
 *.sqlite*
 design-qa.md
