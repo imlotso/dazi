@@ -12,6 +12,8 @@ Article selection (2026-11-13): replace the short demo passages with real, sourc
 
 Article mood preference (confirmed 2026-11-14): include both warm/healing stories and sadness, regret, or longing; keep topics varied rather than giving the whole collection one uniform mood.
 
+Custom backgrounds (2026-11-14): provide a complete user workflow, including image selection/drop, preview, display adjustments, replacement, restoring the original background, persistent local storage and account-scoped synchronization. Preserve readable controls and the established visual identity around user images. Verify the feature and CI before merging to main.
+
 Practice must default to five minutes, accept whole-minute durations from 1 through 60, and finish immediately when the selected article is fully entered. Preserve unfinished progress locally, support pause and resume, handle Chinese IME composition correctly, calculate speed from active time, and display article length, entered characters, errors, and backspace count.
 
 Run the local server yourself and open the preview in the browser available to this environment. Do not give the user server-start instructions when you can run it.

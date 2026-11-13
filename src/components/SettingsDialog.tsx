@@ -12,13 +12,15 @@ type Props = {
   syncState: SyncState;
   onSync: () => void;
   isSignedIn: boolean;
+  onBackground?: () => void;
+  hasBackground?: boolean;
 };
 
 const syncNames: Record<SyncState, string> = {
   guest: '仅本机', loading: '正在读取', syncing: '同步中', synced: '已同步', error: '同步失败',
 };
 
-export function SettingsDialog({ settings, onChange, locked, onClose, onFocus, focused, syncState, onSync, isSignedIn }: Props) {
+export function SettingsDialog({ settings, onChange, locked, onClose, onFocus, focused, syncState, onSync, isSignedIn, onBackground, hasBackground }: Props) {
   const [invalidMinutes, setInvalidMinutes] = useState<string>();
   const canSetMinutes = !locked && settings.mode === 'timed';
 
@@ -52,6 +54,10 @@ export function SettingsDialog({ settings, onChange, locked, onClose, onFocus, f
         <div className="feature-actions">
           <button className="outline-button feature-action-button" onClick={onFocus}>{focused ? '退出专注' : '进入专注'}</button>
         </div>
+      </fieldset>
+      <fieldset className="settings-group">
+        <legend>外观</legend>
+        <div className="settings-sync"><span className="feature-muted">{hasBackground ? '自定义背景' : '默认背景'}</span><button className="outline-button feature-action-button" onClick={onBackground}>背景图</button></div>
       </fieldset>
       <fieldset className="settings-group">
         <legend>同步</legend>

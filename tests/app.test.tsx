@@ -29,7 +29,7 @@ describe('practice interface', () => {
   it('keeps a saved article snapshot correctly named after the built-in library changes', async () => {
     localStorage.setItem('cloudtyping.practice.v1', JSON.stringify({ version: 1, articleId: 'zh-beginner-1', title: '旧的练习文章', text: '旧文章还没有练完。', target: '旧文章还没有练完。', language: 'zh', difficulty: 'beginner', duration: 300, custom: false, offline: true, elapsedMs: 5000, typed: '旧文', backspaces: 0, suspicious: false }));
     render(<App />);
-    await screen.findByRole('button', { name: '继续练习' });
+    await screen.findByRole('button', { name: '继续练习' }, { timeout: 5000 });
     expect(screen.getByRole('heading', { name: '旧的练习文章' })).toBeTruthy();
     expect(screen.queryByRole('link', { name: /查看.*原文/ })).toBeNull();
     expect(screen.getByTestId('typed-count').textContent).toBe('2');

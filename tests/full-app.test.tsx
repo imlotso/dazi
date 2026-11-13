@@ -4,6 +4,8 @@ import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { App } from '../src/App';
 import { readDraft } from '../src/hooks/usePractice';
 import { putWorkspaceValue, readWorkspace } from '../src/lib/workspace';
+import { defaultBackground } from '../src/lib/background';
+import { defaultSettings } from '../src/lib/models';
 
 const response = (value: unknown) => ({ ok: true, json: async () => value }) as Response;
 
@@ -29,6 +31,31 @@ function more(name: string) {
   fireEvent.click(screen.getByRole('button', { name: '更多' }));
   fireEvent.click(screen.getByRole('button', { name }));
 }
+
+it.each(['adjust', 'reset'])('keeps the edited background theme fixed when remote settings switch themes (%s)', async (action) => {
+  const owner = 'background-theme-owner';
+  const image = { name: 'day.png', width: 1, height: 1, image: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jG3cAAAAASUVORK5CYII=' };
+  const night = defaultBackground('dark', { ...image, name: 'night.png' });
+  await putWorkspaceValue(owner, 'background', 'light', defaultBackground('light', image));
+  await putWorkspaceValue(owner, 'background', 'dark', night);
+  await putWorkspaceValue(owner, 'settings', 'preferences', { ...defaultSettings, theme: 'light' });
+  vi.stubGlobal('fetch', vi.fn(async (url: string) => response(url === '/api/me' ? { user: { id: owner, username: '背景账号' } } : { items: [], serverTime: Date.now() })));
+  render(<App />);
+  await screen.findByRole('button', { name: /背景账号/ });
+  await waitFor(() => expect((screen.getByRole('button', { name: '开始练习' }) as HTMLButtonElement).disabled).toBe(false));
+  more('设置'); fireEvent.click(screen.getByRole('button', { name: '背景图' }));
+  if (action === 'reset') fireEvent.click(screen.getByRole('button', { name: '恢复默认' }));
+  else fireEvent.change(screen.getByRole('slider', { name: '模糊' }), { target: { value: 4 } });
+  await act(() => putWorkspaceValue(owner, 'settings', 'preferences', { ...defaultSettings, theme: 'dark' }));
+  expect(screen.getByRole('dialog', { name: '日间背景' })).toBeTruthy();
+  fireEvent.click(screen.getByRole('button', { name: '保存' }));
+  await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+  const items = await readWorkspace(owner);
+  expect(items.find((item) => item.kind === 'background' && item.id === 'dark')?.value).toEqual(night);
+  const day = items.find((item) => item.kind === 'background' && item.id === 'light');
+  if (action === 'reset') expect(day?.deleted).toBe(true);
+  else expect(day?.value).toMatchObject({ name: 'day.png', blur: 4 });
+});
 
 it('parks active text across navigation and resumes its exact draft', async () => {
   render(<App />);

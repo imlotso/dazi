@@ -6,6 +6,7 @@ import { createHash } from 'node:crypto';
 import Database from 'better-sqlite3';
 import { createApp } from '../server/app';
 import { splitCharacters } from '../src/lib/scoring';
+import { pngFixture } from './background-fixture';
 
 describe('extended practice API', () => {
   let app: Awaited<ReturnType<typeof createApp>>;
@@ -82,6 +83,44 @@ describe('extended practice API', () => {
     }
     expect((await sync(Array(101).fill(favorite), headers)).statusCode).toBe(400);
     expect((await workspace(headers)).json().items).toEqual([]);
+  });
+
+  it('syncs private day/night backgrounds, validates images and preserves resets across restart', async () => {
+    const owner = await register('background_owner');
+    const other = await register('background_other');
+    const value = {
+      image: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jG3cAAAAASUVORK5CYII=',
+      name: 'cloud.png', width: 1, height: 1, fit: 'cover', positionX: 50, positionY: 50, blur: 0, shade: 20,
+    };
+    const day = { kind: 'background', id: 'light', updatedAt: now, value };
+    const night = { ...day, id: 'dark', value: { ...value, shade: 40 } };
+    expect((await sync([day, night], owner)).statusCode).toBe(200);
+    expect((await workspace(other)).json().items).toEqual([]);
+    const firstHeaders = { ...owner, 'x-workspace-backgrounds': 'initial' };
+    const first = (await workspace(firstHeaders)).json();
+    expect(first.backgroundsVersion).toMatch(/^[a-f0-9]{64}$/);
+    const knownHeaders = { ...owner, 'x-workspace-backgrounds': first.backgroundsVersion };
+    const cached = (await workspace(knownHeaders)).json();
+    expect(cached.backgroundsUnchanged).toBe(true);
+    expect(cached.items).toEqual([]);
+    expect((await sync([], knownHeaders)).json().items).toEqual([]);
+    for (const invalid of [
+      { ...day, id: 'arbitrary' },
+      { ...day, value: { ...value, image: 'data:image/svg+xml;base64,PHN2Zz4=' } },
+      { ...day, value: { ...value, image: 'https://example.com/image.png' } },
+      { ...day, value: { ...value, image: value.image.replace('image/png', 'image/jpeg') } },
+      { ...day, value: { ...value, image: 'data:image/png;base64,' + 'A'.repeat(1_100_000) } },
+      { ...day, value: { ...value, shade: 100 } },
+      { ...day, value: { ...value, image: pngFixture(10_000, 5000) } },
+    ]) expect((await sync([invalid], owner)).statusCode).toBe(400);
+    const deleted = { kind: 'background', id: 'light', updatedAt: ++now, deleted: true };
+    expect((await sync([deleted], owner)).statusCode).toBe(200);
+    expect((await workspace(knownHeaders)).json().backgroundsUnchanged).toBe(false);
+    await sync([day], owner);
+    await app.close(); app = await open();
+    expect((await workspace(owner)).json().items).toEqual(expect.arrayContaining([deleted, night]));
+    expect((await sync([{ ...day, updatedAt: ++now }], owner)).statusCode).toBe(200);
+    expect((await workspace(owner)).json().items.find((item: { id: string }) => item.id === 'light').deleted).toBeUndefined();
   });
 
   it('preserves a draft tombstone against live uploads regardless of timestamps', async () => {

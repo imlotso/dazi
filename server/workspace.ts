@@ -2,6 +2,7 @@ import type Database from 'better-sqlite3';
 import { z } from 'zod';
 import { difficulties } from '../src/data/articles';
 import type { WorkspaceItem, WorkspaceKind } from '../src/lib/models';
+import { isBackgroundConfig, type BackgroundConfig } from '../src/lib/background';
 
 export const syncBodyLimit = 4 * 1024 * 1024;
 const maxWorkspaceItems = 2000;
@@ -36,6 +37,7 @@ const stats = {
   offset: integer(30_000),
 };
 const schemas = {
+  background: z.custom<BackgroundConfig>(isBackgroundConfig),
   favorite: z.object({ articleId: id }),
   article: snapshot.extend({ custom: z.literal(true), text: z.string().min(1).max(20_000) }),
   draft: z.object({
@@ -59,7 +61,7 @@ const schemas = {
   }),
 } satisfies Record<WorkspaceKind, z.ZodType>;
 const item = z.object({
-  kind: z.enum(['favorite', 'article', 'draft', 'record', 'settings']),
+  kind: z.enum(['favorite', 'article', 'draft', 'record', 'settings', 'background']),
   id, updatedAt: timestamp, deleted: z.boolean().optional(), value: z.unknown().optional(),
 });
 const batch = z.array(item).max(100);
@@ -70,6 +72,7 @@ export function validateWorkspaceItems(items: unknown, owner: string, now: numbe
   const validated: WorkspaceItem[] = [];
   for (const { kind, id, updatedAt, deleted, value } of parsed.data) {
     if (updatedAt > now + clockGraceMs) return null;
+    if (kind === 'background' && id !== 'light' && id !== 'dark') return null;
     if (deleted) {
       validated.push({ kind, id, updatedAt, deleted: true });
       continue;

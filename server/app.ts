@@ -316,12 +316,25 @@ export async function createApp(options: AppOptions) {
     return { ok: true };
   });
 
+  function workspaceResponse(request: FastifyRequest, owner: string, serverTime: number) {
+    const items = workspace.get(owner);
+    const known = request.headers['x-workspace-backgrounds'];
+    if (typeof known !== 'string') return { items, serverTime };
+    const backgrounds = items.filter((item) => item.kind === 'background');
+    const version = createHash('sha256').update(owner).update(JSON.stringify(backgrounds)).digest('hex');
+    const unchanged = known === version;
+    return {
+      items: unchanged ? items.filter((item) => item.kind !== 'background') : items,
+      serverTime, backgroundsVersion: version, backgroundsUnchanged: unchanged,
+    };
+  }
+
   app.get('/api/workspace', async (request, reply) => {
     const user = userFor(request);
     if (!user) return invalid(reply, '请先登录', 401);
     if (!accountMatches(request, user)) return invalid(reply, '登录账号已变更', 403);
     reply.header('Cache-Control', 'no-store');
-    return { items: workspace.get(user.id), serverTime: now() };
+    return workspaceResponse(request, user.id, now());
   });
 
   app.post('/api/workspace/sync', { bodyLimit: syncBodyLimit }, async (request, reply) => {
@@ -337,7 +350,7 @@ export async function createApp(options: AppOptions) {
       throw error;
     }
     reply.header('Cache-Control', 'no-store');
-    return { items: workspace.get(user.id), serverTime };
+    return workspaceResponse(request, user.id, serverTime);
   });
 
   const findOwnedChallenge = (request: FastifyRequest, reply: FastifyReply) => {

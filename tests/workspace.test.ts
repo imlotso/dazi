@@ -6,6 +6,7 @@ import {
   chunkWorkspaceItems, deleteWorkspaceValue, isWorkspaceDraftDeleted, mergeWorkspaceItems, newerWorkspaceItems, putWorkspaceValue, readWorkspace,
 } from '../src/lib/workspace';
 import type { SavedPractice, WorkspaceItem } from '../src/lib/models';
+import { defaultBackground } from '../src/lib/background';
 
 const favorite = (id: string, updatedAt = Date.now()): WorkspaceItem =>
   ({ kind: 'favorite', id, updatedAt, value: { articleId: id } });
@@ -19,6 +20,30 @@ const draft: SavedPractice = {
 
 beforeEach(() => localStorage.clear());
 afterEach(() => { cleanup(); vi.unstubAllGlobals(); vi.restoreAllMocks(); });
+
+it('reuses unchanged cloud images without downloading or uploading them on ordinary workspace edits', async () => {
+  const background: WorkspaceItem = { kind: 'background', id: 'light', updatedAt: 1, value: defaultBackground('light', {
+    image: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jG3cAAAAASUVORK5CYII=', name: 'cloud.png', width: 1, height: 1,
+  }) };
+  const version = 'a'.repeat(64);
+  let remote = [background];
+  const fetcher = vi.fn(async (_url: string, options: RequestInit) => {
+    if (options.method === 'POST') remote = mergeWorkspaceItems(remote, JSON.parse(options.body as string).items);
+    const cached = new Headers(options.headers).get('X-Workspace-Backgrounds') === version;
+    return new Response(JSON.stringify({ items: cached ? remote.filter((item) => item.kind !== 'background') : remote, backgroundsVersion: version, backgroundsUnchanged: cached, serverTime: Date.now() }));
+  });
+  vi.stubGlobal('fetch', fetcher);
+  const { result } = renderHook(() => useWorkspace('background-cache'));
+  await waitFor(() => expect(result.current.syncState).toBe('synced'));
+  expect(result.current.backgrounds.light).toEqual(background.value);
+  await act(async () => { await result.current.toggleFavorite('article'); await result.current.sync(); });
+  expect(result.current.backgrounds.light).toEqual(background.value);
+  expect(result.current.favorites).toEqual(['article']);
+  expect(fetcher.mock.calls.some(([, options]) => new Headers(options.headers).get('X-Workspace-Backgrounds') === version)).toBe(true);
+  const writes = fetcher.mock.calls.filter(([, options]) => options.method === 'POST');
+  expect(writes.length).toBeGreaterThan(0);
+  expect(writes.flatMap(([, options]) => JSON.parse(options.body as string).items).some((item: WorkspaceItem) => item.kind === 'background')).toBe(false);
+});
 
 describe('local workspace', () => {
   it('retains tombstones, keeps newer edits and lets the incoming server item win ties', () => {

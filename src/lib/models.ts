@@ -1,4 +1,5 @@
 import type { ArticleSource, Difficulty, Language } from '../data/articles';
+import type { BackgroundConfig } from './background';
 
 export type PracticeMode = 'timed' | 'article';
 export type ReaderSettings = {
@@ -32,6 +33,7 @@ export type WorkspaceValues = {
   draft: SavedPractice;
   record: PracticeRecord;
   settings: ReaderSettings;
+  background: BackgroundConfig;
 };
 export type WorkspaceKind = keyof WorkspaceValues;
 export type WorkspaceItem = { kind: WorkspaceKind; id: string; updatedAt: number; deleted?: boolean; value?: unknown };

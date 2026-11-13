@@ -3,7 +3,7 @@ import { api, ApiError } from '../lib/api';
 import type { ReaderSettings, SyncState, WorkspaceItem, WorkspaceKind, WorkspaceValues } from '../lib/models';
 import {
   cachedWorkspace, chunkWorkspaceItems, deleteWorkspaceValue, isWorkspaceItem, mergeRemoteWorkspace, mutateWorkspaceValue,
-  newerWorkspaceItems, putWorkspaceValue, readWorkspace, subscribeWorkspace, workspaceItemKey, workspaceSettings,
+  newerWorkspaceItems, putWorkspaceValue, readWorkspace, subscribeWorkspace, workspaceItemKey, workspaceSettings, workspaceValue,
 } from '../lib/workspace';
 
 const pollMs = 30_000;
@@ -18,18 +18,24 @@ type View = {
   syncState: SyncState;
   error: string;
 };
-type Response = { items: WorkspaceItem[]; serverTime: number };
+type Response = { items: WorkspaceItem[]; serverTime: number; backgroundsVersion?: string; backgroundsUnchanged?: boolean };
+type KnownBackgrounds = { version: string; items: WorkspaceItem[] };
 
-async function workspaceRequest(owner: string, signal: AbortSignal, items?: WorkspaceItem[]): Promise<Response> {
+async function workspaceRequest(owner: string, signal: AbortSignal, items?: WorkspaceItem[], known?: KnownBackgrounds): Promise<Response> {
   const data = await api<Response>(items === undefined ? '/api/workspace' : '/api/workspace/sync', {
     method: items === undefined ? 'GET' : 'POST',
     body: items === undefined ? undefined : { items },
-    headers: { 'X-Workspace-Owner': owner },
+    headers: { 'X-Workspace-Owner': owner, 'X-Workspace-Backgrounds': known?.version ?? 'initial' },
     signal,
   });
   if (!Array.isArray(data.items) || data.items.length > 2000 || !data.items.every(isWorkspaceItem) ||
     !Number.isSafeInteger(data.serverTime) || data.serverTime <= 0) {
     throw new Error('同步数据无法读取');
+  }
+  if (data.backgroundsVersion !== undefined && (typeof data.backgroundsVersion !== 'string' || !/^[a-f0-9]{64}$/.test(data.backgroundsVersion))) throw new Error('同步数据无法读取');
+  if (data.backgroundsUnchanged) {
+    if (!known || data.backgroundsVersion !== known.version || data.items.some((item) => item.kind === 'background')) throw new Error('同步数据无法读取');
+    return { ...data, items: [...data.items, ...known.items] };
   }
   return data;
 }
@@ -49,6 +55,14 @@ export function useWorkspace(ownerId: string | null, enabled = true) {
     let running: Promise<void> | undefined;
     let lastStartedAt = -Infinity;
     let pendingWrite = false;
+    let knownBackgrounds: KnownBackgrounds | undefined;
+    const requestWorkspace = async (items?: WorkspaceItem[]) => {
+      const response = await workspaceRequest(ownerId!, signal, items, knownBackgrounds);
+      if (!signal.aborted) knownBackgrounds = response.backgroundsVersion
+        ? { version: response.backgroundsVersion, items: response.items.filter((item) => item.kind === 'background') }
+        : undefined;
+      return response;
+    };
     setView({ ownerId, ready: !!cached, cloudLoaded: false, items: cached ?? emptyItems, syncState: ownerId ? 'loading' : 'guest', error: '' });
 
     const publish = (patch: Partial<View>) => {
@@ -86,7 +100,7 @@ export function useWorkspace(ownerId: string | null, enabled = true) {
       publish({ syncState: 'syncing', error: '' });
       running = (async () => {
         try {
-          let cloud = await workspaceRequest(ownerId, signal);
+          let cloud = await requestWorkspace();
           if (signal.aborted) return;
           const local = await mergeRemoteWorkspace(ownerId, cloud.items, cloud.serverTime, signal);
           publish({ cloudLoaded: true });
@@ -107,7 +121,7 @@ export function useWorkspace(ownerId: string | null, enabled = true) {
             if (!batch) { remaining.clear(); return; }
             for (const item of batch) remaining.delete(workspaceItemKey(item));
             try {
-              cloud = await workspaceRequest(ownerId, signal, batch);
+              cloud = await requestWorkspace(batch);
             } catch (error) {
               if (!(error instanceof ApiError) || error.status !== 400) throw error;
               if (batch.length === 1) {
@@ -184,6 +198,7 @@ export function useWorkspace(ownerId: string | null, enabled = true) {
     const get = <K extends WorkspaceKind>(kind: K) => active.filter((item) => item.kind === kind).map((item) => item.value as WorkspaceValues[K]);
     return {
       settings: workspaceSettings(items),
+      backgrounds: { light: workspaceValue(items, 'background', 'light'), dark: workspaceValue(items, 'background', 'dark') },
       favorites: get('favorite').map((favorite) => favorite.articleId),
       privateArticles: get('article'),
       drafts: get('draft').sort((a, b) => b.savedAt - a.savedAt),

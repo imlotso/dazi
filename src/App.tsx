@@ -17,6 +17,8 @@ import { Sun } from '@phosphor-icons/react/Sun';
 import { Trophy } from '@phosphor-icons/react/Trophy';
 import { UserCircle } from '@phosphor-icons/react/UserCircle';
 import { ArticleLibrary } from './components/ArticleLibrary';
+import { BackgroundDialog } from './components/BackgroundDialog';
+import { RoomBackground } from './components/RoomBackground';
 import { AuthDialog } from './components/AuthDialog';
 import { Dialog } from './components/Dialog';
 import { DraftsView } from './components/DraftsView';
@@ -127,6 +129,7 @@ function PracticeApp({ user, authReady, onUser }: { user: User | null; authReady
   const [showCustom, setShowCustom] = useState(false);
   const [showResult, setShowResult] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
+  const [showBackground, setShowBackground] = useState<Theme>();
   const [showMore, setShowMore] = useState(false);
   const [focused, setFocused] = useState(false);
   const [showAuth, setShowAuth] = useState(false);
@@ -295,7 +298,7 @@ function PracticeApp({ user, authReady, onUser }: { user: User | null; authReady
       else if (wasFullscreen) setFocused(false);
     };
     const escape = (event: KeyboardEvent) => {
-      if (event.key === 'Escape' && !showResult && !confirmPractice) exitFocus();
+      if (event.key === 'Escape' && !showResult && !confirmPractice && !showSettings && !showBackground) exitFocus();
     };
     document.addEventListener('fullscreenchange', fullscreenChange);
     document.addEventListener('keydown', escape);
@@ -303,7 +306,7 @@ function PracticeApp({ user, authReady, onUser }: { user: User | null; authReady
       document.removeEventListener('fullscreenchange', fullscreenChange);
       document.removeEventListener('keydown', escape);
     };
-  }, [focused, showResult, confirmPractice]);
+  }, [focused, showResult, confirmPractice, showSettings, showBackground]);
 
   function exitFocus() {
     setFocused(false);
@@ -567,7 +570,7 @@ function PracticeApp({ user, authReady, onUser }: { user: User | null; authReady
         {user ? <button className="account-button" disabled={!canChangeAccount} onClick={() => void changeAccount()} title="退出登录"><UserCircle size={21} /> {user.username} <SignOut size={16} /></button> : <button className="account-button" disabled={!canChangeAccount} onClick={() => void changeAccount()}>登录</button>}
       </nav>
     </header>}
-    <main className="room">
+    <RoomBackground theme={theme} background={workspace.backgrounds[theme]}>
       <div className="workspace">
         {view === 'practice' && <>
           {focused ? <div className="focus-actions"><button ref={focusButton} className="outline-button feature-action-button" onClick={exitFocus}>退出专注</button></div> : filters}
@@ -625,15 +628,15 @@ function PracticeApp({ user, authReady, onUser }: { user: User | null; authReady
           </li>)}</ul>}
         </section>}
       </div>
-      <img className="sleeping-cat" src="/assets/sleeping-cat.png" alt="" aria-hidden="true" />
-    </main>
+    </RoomBackground>
     {showCustom && <Dialog title="自定义练习文字" onClose={() => setShowCustom(false)}>
       <label className="custom-editor">练习文字<textarea aria-label="自定义文章内容" value={customDraft} maxLength={20000} onChange={(event) => setCustomDraft(event.target.value)} /></label>
       {customError && <p className="form-error" role="alert">{customError}</p>}
       <div className="result-actions"><span className="custom-count">{splitCharacters(customDraft).length} / 20000 字符</span><button className="primary-button" onClick={useCustomText}>使用这段文字</button></div>
     </Dialog>}
     {showAuth && <AuthDialog onClose={() => setShowAuth(false)} onLogin={onUser} />}
-    {showSettings && <SettingsDialog settings={{ ...workspace.settings, minutes: locked ? currentDuration / 60 : duration / 60, mode: locked ? currentMode : workspace.settings.mode, strict: locked ? currentStrict : workspace.settings.strict }} onChange={updateSettings} locked={locked} onClose={() => setShowSettings(false)} onFocus={enterFocus} focused={focused} syncState={workspace.syncState} onSync={() => void workspace.sync()} isSignedIn={!!user} />}
+    {showSettings && <SettingsDialog settings={{ ...workspace.settings, minutes: locked ? currentDuration / 60 : duration / 60, mode: locked ? currentMode : workspace.settings.mode, strict: locked ? currentStrict : workspace.settings.strict }} onChange={updateSettings} locked={locked} onClose={() => setShowSettings(false)} onFocus={enterFocus} focused={focused} syncState={workspace.syncState} onSync={() => void workspace.sync()} isSignedIn={!!user} hasBackground={!!workspace.backgrounds[theme]} onBackground={() => { setShowSettings(false); setShowBackground(theme); }} />}
+    {showBackground && <BackgroundDialog theme={showBackground} value={workspace.backgrounds[showBackground]} onClose={() => setShowBackground(undefined)} onSave={(background) => background ? workspace.put('background', showBackground, background) : workspace.remove('background', showBackground)} />}
     {confirmPractice && <Dialog title={confirmPractice.action === 'restart' ? '重新开始本次练习？' : '结束本次练习？'} onClose={cancelPracticeAction}>
       {confirmPractice.action === 'restart' && <p className="dialog-intro">本次输入和计时将被清除。</p>}
       {phase === 'restoring' && <p className="dialog-intro" role="status">恢复中…</p>}

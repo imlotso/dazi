@@ -1,5 +1,6 @@
 import { defaultSettings, type ReaderSettings, type WorkspaceItem, type WorkspaceKind, type WorkspaceValues } from './models';
 import { themeStorageKey } from './theme';
+import { isBackgroundConfig } from './background';
 
 const databaseName = 'cloudtyping-workspace';
 const itemStore = 'items';
@@ -30,12 +31,14 @@ const isArticle = (value: unknown) => isObject(value) && typeof value.id === 'st
 export function isWorkspaceItem(value: unknown): value is WorkspaceItem {
   if (!isObject(value)) return false;
   const { kind, id, updatedAt, deleted, value: payload } = value;
-  if (!['favorite', 'article', 'draft', 'record', 'settings'].includes(kind as string) ||
+  if (!['favorite', 'article', 'draft', 'record', 'settings', 'background'].includes(kind as string) ||
     typeof id !== 'string' || !id || typeof updatedAt !== 'number' || !Number.isSafeInteger(updatedAt) || updatedAt < 0 ||
     (deleted !== undefined && typeof deleted !== 'boolean')) return false;
+  if (kind === 'background' && !isTheme(id)) return false;
   if (deleted) return true;
   if (!isObject(payload)) return false;
   switch (kind) {
+    case 'background': return isBackgroundConfig(payload);
     case 'favorite': return payload.articleId === id;
     case 'article': return payload.id === id && payload.custom === true && isArticle(payload);
     case 'draft': return payload.id === id && isArticle(payload.article) &&
