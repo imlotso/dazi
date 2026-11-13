@@ -12,10 +12,10 @@ import { MoonStars } from '@phosphor-icons/react/MoonStars';
 import { Pause } from '@phosphor-icons/react/Pause';
 import { Play } from '@phosphor-icons/react/Play';
 import { SignOut } from '@phosphor-icons/react/SignOut';
-import { Sparkle } from '@phosphor-icons/react/Sparkle';
 import { Sun } from '@phosphor-icons/react/Sun';
 import { Trophy } from '@phosphor-icons/react/Trophy';
 import { UserCircle } from '@phosphor-icons/react/UserCircle';
+import { AdminConsole } from './components/AdminConsole';
 import { ArticleLibrary } from './components/ArticleLibrary';
 import { BackgroundDialog } from './components/BackgroundDialog';
 import { RoomBackground } from './components/RoomBackground';
@@ -32,18 +32,16 @@ import { articles, type Difficulty, type Language } from './data/articles';
 import { continuationDraftId, discardSavedDraft, localHistory, practiceDraftId, readDraft, readDrafts, savedPracticeFromLegacy, usePractice, type PracticeDraft } from './hooks/usePractice';
 import { useWorkspace } from './hooks/useWorkspace';
 import { api, type User } from './lib/api';
-import { type ArticleSnapshot, type PracticeRecord, type ReaderSettings, type SavedPractice } from './lib/models';
+import { catalogSnapshotKey, type ArticleSnapshot, type PracticeRecord, type ReaderSettings, type SavedPractice } from './lib/models';
 import { readableCharacter } from './lib/practice-lines';
 import { scoreTyping, splitCharacters } from './lib/scoring';
 import { resolveTheme, themeStorageKey, type Theme } from './lib/theme';
 import { deleteWorkspaceValue, DraftDeletedError, isWorkspaceDraftDeleted, putWorkspaceValue } from './lib/workspace';
 
 type View = 'practice' | 'library' | 'rankings' | 'history' | 'drafts' | 'mistakes' | 'stats' | 'admin';
-type ReviewEntry = { id: string; nickname: string; language: Language; difficulty: Difficulty; duration: number; speed: number; accuracy: number; checkpoints: number; reasons: string[] };
 type PendingLoad = { legacy: PracticeDraft } | { draft: SavedPractice; newRound?: boolean };
 const difficultyNames: Record<Difficulty, string> = { beginner: '入门', intermediate: '进阶', advanced: '挑战' };
 const languageNames: Record<Language, string> = { zh: '中文', en: 'English' };
-const reviewReasonNames: Record<string, string> = { paste_or_drop: '检测到粘贴或拖放', unusual_progress: '输入进度异常', missing_activity: '练习进度记录不足', stale_activity: '结束前进度记录缺失', high_speed: '速度较高', paused_session: '练习曾暂停或恢复', timing_discrepancy: '计时差异较大' };
 const builtIns: ArticleSnapshot[] = articles.map(({ content, ...article }) => ({ ...article, text: content, custom: false }));
 const builtInById = new Map(builtIns.map((article) => [article.id, article]));
 const recordViews: View[] = ['history', 'mistakes', 'stats'];
@@ -120,8 +118,13 @@ function PracticeApp({ user, authReady, onUser }: { user: User | null; authReady
   const ownerId = user?.id ?? null;
   const workspace = useWorkspace(ownerId, authReady);
   const [selection, setSelection] = useState(builtIns[0]);
+  const [publicArticles, setPublicArticles] = useState(builtIns);
+  const [catalogRevision, setCatalogRevision] = useState(0);
+  const refreshCatalog = useCallback(() => setCatalogRevision((revision) => revision + 1), []);
   const [guestTheme, setGuestTheme] = useState(initialTheme);
-  const [view, setView] = useState<View>('practice');
+  const [directAdmin] = useState(() => /^\/admin\/?$/.test(window.location.pathname));
+  const [view, setView] = useState<View>(() => directAdmin && user?.isAdmin ? 'admin' : 'practice');
+  const [adminLoginDismissed, setAdminLoginDismissed] = useState(false);
   const [minutesText, setMinutesText] = useState<string>();
   const [pendingTheme, setPendingTheme] = useState<Theme>();
   const [customDraft, setCustomDraft] = useState('');
@@ -142,7 +145,6 @@ function PracticeApp({ user, authReady, onUser }: { user: User | null; authReady
   const [feedback, setFeedback] = useState('');
   const [pendingLoad, setPendingLoad] = useState<PendingLoad>();
   const [remoteHistory, setRemoteHistory] = useState<PracticeRecord[]>([]);
-  const [review, setReview] = useState<ReviewEntry[]>([]);
   const [historyError, setHistoryError] = useState(false);
   const bootstrapped = useRef(false);
   const interacted = useRef(false);
@@ -153,7 +155,9 @@ function PracticeApp({ user, authReady, onUser }: { user: User | null; authReady
   const focusRoot = useRef<HTMLDivElement>(null);
   const live = useRef(true);
   const { language, difficulty, title: displayTitle, text } = selection;
-  const catalog = useMemo(() => [...builtIns, ...workspace.privateArticles], [workspace.privateArticles]);
+  const publicById = useMemo(() => new Map(publicArticles.map((article) => [article.id, catalogSnapshotKey(article)])), [publicArticles]);
+  const selectedCatalogKey = useMemo(() => catalogSnapshotKey(selection), [selection]);
+  const catalog = useMemo(() => [...publicArticles, ...workspace.privateArticles], [publicArticles, workspace.privateArticles]);
   const availableArticles = useMemo(() => catalog.filter((article) => article.language === language && article.difficulty === difficulty), [catalog, difficulty, language]);
   const configuredMinutes = minutesText ?? String(workspace.settings.minutes);
   const minutes = Number(configuredMinutes);
@@ -161,11 +165,13 @@ function PracticeApp({ user, authReady, onUser }: { user: User | null; authReady
   const duration = validDuration ? minutes * 60 : workspace.settings.minutes * 60;
   const theme = user ? pendingTheme ?? workspace.settings.theme : guestTheme;
   const ready = authReady && workspace.ready;
+  const adminLogin = directAdmin && authReady && !user && !adminLoginDismissed;
   const reportSaveError = useCallback(() => { if (live.current) setFeedback('无法保存进度'); }, []);
 
   const practice = usePractice({
     article: selection, articleId: selection.id, title: displayTitle, text, language, difficulty, duration,
-    custom: selection.custom || builtInById.get(selection.id)?.text !== text, ownerId,
+    custom: selection.custom || publicById.get(selection.id) !== selectedCatalogKey,
+    guardCatalog: true, onCatalogStale: refreshCatalog, ownerId,
     mode: workspace.settings.mode, strict: workspace.settings.strict, autoPause: workspace.settings.autoPause,
     onRecord(record) {
       if (record.recordId) void putWorkspaceValue(record.ownerId ?? null, 'record', record.recordId, record).catch(reportSaveError);
@@ -200,6 +206,16 @@ function PracticeApp({ user, authReady, onUser }: { user: User | null; authReady
     live.current = true;
     return () => { live.current = false; };
   }, []);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    void api<{ articles: ArticleSnapshot[] }>('/api/articles', { signal: controller.signal }).then(({ articles: published }) => {
+      if (controller.signal.aborted || !Array.isArray(published) || !published.length) return;
+      setPublicArticles(published);
+      if (!interacted.current) setSelection((current) => current === builtIns[0] ? published[0] : current);
+    }).catch(() => { /* Bundled articles are available on static and offline deployments. */ });
+    return () => controller.abort();
+  }, [catalogRevision]);
 
   useEffect(() => {
     if (!ready || bootstrapped.current || (ownerId && !workspace.cloudLoaded)) return;
@@ -432,7 +448,7 @@ function PracticeApp({ user, authReady, onUser }: { user: User | null; authReady
   function nextArticle() {
     if (locked) return;
     const index = availableArticles.findIndex((article) => article.id === selection.id);
-    resetPractice(availableArticles[(index + 1) % availableArticles.length] ?? builtIns[0], true);
+    resetPractice(availableArticles[(index + 1) % availableArticles.length] ?? publicArticles[0], true);
   }
 
   async function requestPracticeAction(action: 'restart' | 'finish') {
@@ -449,12 +465,12 @@ function PracticeApp({ user, authReady, onUser }: { user: User | null; authReady
 
   function changeLanguage(next: Language) {
     if (locked || next === language) return;
-    resetPractice(builtIns.find((item) => item.language === next && item.difficulty === difficulty)!, true);
+    resetPractice(publicArticles.find((item) => item.language === next && item.difficulty === difficulty) ?? publicArticles[0], true);
   }
 
   function changeDifficulty(next: Difficulty) {
     if (locked || next === difficulty) return;
-    resetPractice(builtIns.find((item) => item.language === language && item.difficulty === next)!, true);
+    resetPractice(publicArticles.find((item) => item.language === language && item.difficulty === next) ?? publicArticles[0], true);
   }
 
   function changeDuration(event: ChangeEvent<HTMLInputElement>) {
@@ -489,27 +505,6 @@ function PracticeApp({ user, authReady, onUser }: { user: User | null; authReady
       setRankSubmitted(true);
     } catch (problem) { setRankMessage((problem as Error).message); setRankSubmitted(false); }
     finally { setBusy(false); }
-  }
-
-  const loadReview = useCallback(async (signal?: AbortSignal) => {
-    try {
-      const data = await api<{ entries: ReviewEntry[] }>('/api/admin/review', { signal });
-      if (!signal?.aborted) setReview(data.entries);
-    } catch (problem) {
-      if (!signal?.aborted) setFeedback((problem as Error).message);
-    }
-  }, []);
-
-  useEffect(() => {
-    if (view !== 'admin' || !user?.isAdmin) return;
-    const controller = new AbortController();
-    void loadReview(controller.signal);
-    return () => controller.abort();
-  }, [view, user?.isAdmin, loadReview]);
-
-  async function reviewAction(id: string, action: 'approve' | 'reject') {
-    try { await api(`/api/admin/review/${id}`, { method: 'POST', body: { action } }); await loadReview(); }
-    catch (problem) { setFeedback((problem as Error).message); }
   }
 
   const canChangeAccount = authReady && !pendingLoad && !accountBusy &&
@@ -565,7 +560,7 @@ function PracticeApp({ user, authReady, onUser }: { user: User | null; authReady
             <button onClick={() => { moreButton.current?.focus(); openSettings(); }}>设置</button>
           </div>}
         </div>
-        {user?.isAdmin && <button className={view === 'admin' ? 'nav-active' : ''} onClick={() => navigate('admin')}>审核</button>}
+        {user?.isAdmin && <button className={view === 'admin' ? 'nav-active' : ''} onClick={() => navigate('admin')}>管理后台</button>}
         <button className="theme-button" aria-label={theme === 'dark' ? '切换至日间模式' : '切换至夜间模式'} aria-pressed={theme === 'dark'} onClick={toggleTheme}>{theme === 'dark' ? <Sun size={20} /> : <MoonStars size={20} />}<span>{theme === 'dark' ? '日间' : '夜间'}</span></button>
         {user ? <button className="account-button" disabled={!canChangeAccount} onClick={() => void changeAccount()} title="退出登录"><UserCircle size={21} /> {user.username} <SignOut size={16} /></button> : <button className="account-button" disabled={!canChangeAccount} onClick={() => void changeAccount()}>登录</button>}
       </nav>
@@ -601,10 +596,11 @@ function PracticeApp({ user, authReady, onUser }: { user: User | null; authReady
           </section>
           {practiceNotice && <p className="practice-notice" role="status">{practiceNotice}</p>}
         </>}
+        {directAdmin && user && !user.isAdmin && <p className="form-error view-error" role="alert">没有管理权限</p>}
         {view !== 'practice' && feedback && <p className="form-error view-error" role="alert">{feedback}</p>}
         {historyError && recordViews.includes(view) && <p className="form-error view-error" role="status">连接失败，显示本机记录。</p>}
         {view === 'library' && <ArticleLibrary articles={catalog} favorites={workspace.favorites} onToggleFavorite={(id) => void workspace.toggleFavorite(id).catch(reportSaveError)} onSelect={selectArticle} onSave={(article) => workspace.put('article', article.id, article)} onDelete={(id) => workspace.remove('article', id)} />}
-        {view === 'rankings' && <RankingView initial={{ language, difficulty, duration, mode: currentMode, strict: currentStrict }} articles={builtIns} isAdmin={!!user?.isAdmin} ownerId={ownerId} />}
+        {view === 'rankings' && <RankingView initial={{ language, difficulty, duration, mode: currentMode, strict: currentStrict }} articles={publicArticles} isAdmin={!!user?.isAdmin} ownerId={ownerId} />}
         {view === 'history' && <RecordsView records={records} onReplay={selectArticle} onContinue={continueRecord} />}
         {view === 'drafts' && <DraftsView drafts={draftBox.drafts} onResume={(draft) => continueDraft(draft)} onDelete={deleteDraft}
           recovery={draftBox.completed.map((draft) => ({
@@ -620,13 +616,7 @@ function PracticeApp({ user, authReady, onUser }: { user: User | null; authReady
         />}
         {view === 'mistakes' && <MistakesView records={records} onPractice={selectArticle} />}
         {view === 'stats' && <StatsView records={records} />}
-        {view === 'admin' && user?.isAdmin && <section className="content-panel">
-          <div className="content-heading"><h1><Sparkle size={26} /> 成绩复核</h1></div>
-          {review.length === 0 ? <p className="empty-state">暂无待审核成绩</p> : <ul className="history-list">{review.map((entry) => <li key={entry.id}>
-            <span><strong>{entry.nickname} · {languageNames[entry.language]} {difficultyNames[entry.difficulty]}</strong><small>{entry.duration}秒 · {entry.speed} · 准确率 {entry.accuracy}% · 进度记录 {entry.checkpoints} 次</small><small>复核原因：{entry.reasons.map((reason) => reviewReasonNames[reason] || reason).join('、') || '人工标记'}</small></span>
-            <span className="review-actions"><button className="text-button" onClick={() => void reviewAction(entry.id, 'approve')}>通过</button><button className="text-button" onClick={() => void reviewAction(entry.id, 'reject')}>拒绝</button></span>
-          </li>)}</ul>}
-        </section>}
+        {view === 'admin' && user?.isAdmin && <AdminConsole ownerId={user.id} onCatalogChange={refreshCatalog} />}
       </div>
     </RoomBackground>
     {showCustom && <Dialog title="自定义练习文字" onClose={() => setShowCustom(false)}>
@@ -634,7 +624,7 @@ function PracticeApp({ user, authReady, onUser }: { user: User | null; authReady
       {customError && <p className="form-error" role="alert">{customError}</p>}
       <div className="result-actions"><span className="custom-count">{splitCharacters(customDraft).length} / 20000 字符</span><button className="primary-button" onClick={useCustomText}>使用这段文字</button></div>
     </Dialog>}
-    {showAuth && <AuthDialog onClose={() => setShowAuth(false)} onLogin={onUser} />}
+    {(showAuth || adminLogin) && <AuthDialog onClose={() => { setShowAuth(false); setAdminLoginDismissed(true); }} onLogin={onUser} />}
     {showSettings && <SettingsDialog settings={{ ...workspace.settings, minutes: locked ? currentDuration / 60 : duration / 60, mode: locked ? currentMode : workspace.settings.mode, strict: locked ? currentStrict : workspace.settings.strict }} onChange={updateSettings} locked={locked} onClose={() => setShowSettings(false)} onFocus={enterFocus} focused={focused} syncState={workspace.syncState} onSync={() => void workspace.sync()} isSignedIn={!!user} hasBackground={!!workspace.backgrounds[theme]} onBackground={() => { setShowSettings(false); setShowBackground(theme); }} />}
     {showBackground && <BackgroundDialog theme={showBackground} value={workspace.backgrounds[showBackground]} onClose={() => setShowBackground(undefined)} onSave={(background) => background ? workspace.put('background', showBackground, background) : workspace.remove('background', showBackground)} />}
     {confirmPractice && <Dialog title={confirmPractice.action === 'restart' ? '重新开始本次练习？' : '结束本次练习？'} onClose={cancelPracticeAction}>

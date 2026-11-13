@@ -3,6 +3,7 @@ import { Crown } from '@phosphor-icons/react/Crown';
 import { Trophy } from '@phosphor-icons/react/Trophy';
 import type { Difficulty, Language } from '../data/articles';
 import { api } from '../lib/api';
+import { Dialog } from './Dialog';
 import type { ArticleSnapshot, PracticeMode, RankingEntry } from '../lib/models';
 
 type Board = { entries: RankingEntry[]; self?: RankingEntry | null; total?: number };
@@ -27,7 +28,10 @@ export function RankingView({ initial, articles, isAdmin, ownerId }: Props) {
   const [revision, setRevision] = useState(0);
   const [board, setBoard] = useState<{ query: string; data: Board }>();
   const [failure, setFailure] = useState<{ query: string; message: string }>();
-  const [removing, setRemoving] = useState<string>();
+  const [selectedScore, setSelectedScore] = useState<RankingEntry>();
+  const [reason, setReason] = useState('');
+  const [removeError, setRemoveError] = useState('');
+  const [removing, setRemoving] = useState(false);
   const validMinutes = /^\d+$/.test(minutes) && Number(minutes) >= 1 && Number(minutes) <= 60;
   const query = new URLSearchParams({ language, difficulty, duration: String(mode === 'article' ? 300 : Number(minutes) * 60), mode, strict: String(strict), period });
   if (articleId) query.set('articleId', articleId);
@@ -46,14 +50,20 @@ export function RankingView({ initial, articles, isAdmin, ownerId }: Props) {
     return () => controller.abort();
   }, [request, identity, ownerId]);
 
-  async function removeScore(id: string) {
-    setRemoving(id);
+  async function removeScore() {
+    if (!selectedScore || !reason.trim() || removing || !ownerId) return;
+    setRemoving(true);
+    setRemoveError('');
     try {
-      await api(`/api/admin/remove/${id}`, { method: 'POST', body: {} });
+      await api('/api/admin/scores/moderate', {
+        method: 'POST',
+        headers: { 'X-Workspace-Owner': ownerId },
+        body: { ids: [selectedScore.attemptId], action: 'remove', reason },
+      });
+      setSelectedScore(undefined);
       setRevision((value) => value + 1);
-    } catch (error) {
-      setFailure({ query: identity, message: (error as Error).message });
-    } finally { setRemoving(undefined); }
+    } catch (error) { setRemoveError((error as Error).message); }
+    finally { setRemoving(false); }
   }
 
   const data = board?.query === identity ? board.data : undefined;
@@ -88,8 +98,24 @@ export function RankingView({ initial, articles, isAdmin, ownerId }: Props) {
         <span className="rank-name">{entry.nickname} {entry.guest ? <small>游客</small> : null}</span>
         <span className="rank-accuracy">准确率 {entry.accuracy}%</span>
         <strong>{entry.speed} <small>{unit}</small></strong>
-        {isAdmin && <button className="text-button" disabled={!!removing} onClick={() => void removeScore(entry.attemptId)}>下架</button>}
+        {isAdmin && <button className="text-button" onClick={() => {
+          setReason('');
+          setRemoveError('');
+          setSelectedScore(entry);
+        }}>下架</button>}
       </li>;
     })}</ol>}
+    {selectedScore && <Dialog title="下架成绩" onClose={() => setSelectedScore(undefined)} dismissible={!removing}>
+      <form onSubmit={(event) => { event.preventDefault(); void removeScore(); }}>
+        <p className="dialog-intro">{selectedScore.nickname} · {selectedScore.speed} {unit}</p>
+        <label className="custom-editor">原因<textarea value={reason} maxLength={500} disabled={removing}
+          onChange={(event) => setReason(event.target.value)} /></label>
+        {removeError && <p className="form-error" role="alert">{removeError}</p>}
+        <div className="result-actions">
+          <button type="button" className="outline-button" onClick={() => setSelectedScore(undefined)} disabled={removing}>取消</button>
+          <button type="submit" className="primary-button" disabled={!reason.trim() || removing}>确认下架</button>
+        </div>
+      </form>
+    </Dialog>}
   </section>;
 }

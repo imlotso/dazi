@@ -13,7 +13,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends libatomic1 && r
 COPY --from=build --chown=node:node /app/package.json ./
 COPY --from=build --chown=node:node /app/node_modules ./node_modules
 COPY --from=build --chown=node:node /app/dist ./dist
-COPY --from=build --chown=node:node /app/scripts/backup.mjs ./scripts/backup.mjs
+COPY --from=build --chown=node:node /app/scripts/backup.mjs /app/scripts/bootstrap-admin.mjs ./scripts/
 USER node
 EXPOSE 3001
 CMD ["node", "dist/server/app.js"]

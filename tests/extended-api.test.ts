@@ -294,7 +294,7 @@ describe('extended practice API', () => {
     expect((await request('&articleId=zh-beginner-2')).entries[0].attemptId).toBe(recent);
     expect((await request('&strict=true')).entries).toEqual([]);
     expect((await request('&mode=article')).entries).toEqual([]);
-    await app.inject({ method: 'POST', url: '/api/admin/remove/' + older, headers });
+    await app.inject({ method: 'POST', url: '/api/admin/remove/' + older, headers, payload: { reason: '复核结果' } });
     await app.close();
     app = await open();
     expect((await request()).entries[0].attemptId).toBe(recent);

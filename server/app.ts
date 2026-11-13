@@ -6,10 +6,12 @@ import Database from 'better-sqlite3';
 import argon2 from 'argon2';
 import { createHash, createHmac, randomBytes, randomInt, randomUUID, timingSafeEqual } from 'node:crypto';
 import { existsSync } from 'node:fs';
-import { articles, difficulties, type Difficulty, type Language } from '../src/data/articles';
+import { difficulties, type Difficulty, type Language } from '../src/data/articles';
 import { scoreTyping, splitCharacters } from '../src/lib/scoring';
-import type { ArticleSnapshot, PracticeMode, RankingEntry } from '../src/lib/models';
+import { catalogSnapshotKey, type ArticleSnapshot, type PracticeMode, type RankingEntry } from '../src/lib/models';
 import { createWorkspaceStore, syncBodyLimit, validateWorkspaceItems, WorkspaceLimitError } from './workspace';
+import { AdminAccessError, createAdminAudit, migrateAdministration, registerAdminRoutes } from './admin';
+import { createCatalogStore, registerCatalogRoutes } from './catalog';
 
 export type Mailer = { sendCode(email: string, code: string, purpose: string): Promise<void> };
 export type AppOptions = {
@@ -23,7 +25,7 @@ export type AppOptions = {
   trustProxy?: boolean;
 };
 
-type User = { id: string; username: string; email: string; password_hash: string };
+type User = { id: string; username: string; email: string; password_hash: string; role: 'user' | 'admin'; auth_version: number };
 type Challenge = {
   id: string; owner: string; language: Language; difficulty: Difficulty; duration: number;
   target: string; started_at: number; finished_at: number | null; status: string;
@@ -159,10 +161,13 @@ export async function createApp(options: AppOptions) {
       WHERE published=1 AND status='finished' AND ranking_removed=0`);
   })();
   const workspace = createWorkspaceStore(db);
+  migrateAdministration(db, adminEmail);
+  const catalog = createCatalogStore(db, now);
+  const audit = createAdminAudit(db, now);
 
   const app = Fastify({ logger: false, bodyLimit: 128 * 1024, trustProxy: options.trustProxy ?? false });
   await app.register(cookie);
-  await app.register(rateLimit, { max: 180, timeWindow: '1 minute' });
+  await app.register(rateLimit, { max: 180, timeWindow: '1 minute', allowList: (request) => !request.url.startsWith('/api/') });
   app.addHook('onClose', async () => { db.close(); });
   app.addHook('onRequest', async (request, reply) => {
     if (request.method === 'GET' || request.method === 'HEAD' || !request.headers.origin) return;
@@ -175,16 +180,16 @@ export async function createApp(options: AppOptions) {
   const userFor = (request: FastifyRequest): User | undefined => {
     const token = request.cookies.session;
     if (!token || token.length > 100) return undefined;
-    return db.prepare('SELECT u.* FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token_hash = ? AND s.expires_at > ?').get(digest(token), now()) as User | undefined;
+    return db.prepare('SELECT u.* FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token_hash = ? AND s.expires_at > ? AND u.disabled_at IS NULL').get(digest(token), now()) as User | undefined;
   };
   const expectedAccount = (request: FastifyRequest) => request.headers['x-workspace-owner'];
   const accountMatches = (request: FastifyRequest, user: User) =>
     expectedAccount(request) === undefined || expectedAccount(request) === user.id;
-  const publicUser = (user: User) => ({ id: user.id, username: user.username, email: user.email, isAdmin: !!adminEmail && user.email.toLowerCase() === adminEmail });
+  const publicUser = (user: User) => ({ id: user.id, username: user.username, email: user.email, isAdmin: user.role === 'admin' });
   const startSession = (reply: FastifyReply, user: User) => {
     const token = randomBytes(32).toString('base64url');
-    const inserted = db.prepare('INSERT INTO sessions(token_hash,user_id,expires_at) SELECT ?,id,? FROM users WHERE id=? AND password_hash=?')
-      .run(digest(token), now() + 30 * 86400_000, user.id, user.password_hash);
+    const inserted = db.prepare('INSERT INTO sessions(token_hash,user_id,expires_at) SELECT ?,id,? FROM users WHERE id=? AND password_hash=? AND auth_version=? AND disabled_at IS NULL')
+      .run(digest(token), now() + 30 * 86400_000, user.id, user.password_hash, user.auth_version);
     if (!inserted.changes) return false;
     reply.setCookie('session', token, { ...cookieOptions, maxAge: 30 * 86400 });
     return true;
@@ -207,13 +212,13 @@ export async function createApp(options: AppOptions) {
     const supplied = Buffer.from(getCodeHash(email, purpose, code), 'hex');
     const stored = Buffer.from(row.code_hash, 'hex');
     if (supplied.length !== stored.length || !timingSafeEqual(supplied, stored)) {
-      db.prepare('UPDATE email_codes SET attempts = attempts + 1 WHERE email = ? AND purpose = ?').run(email, purpose);
+      db.prepare('UPDATE email_codes SET attempts=attempts+1 WHERE email=? AND purpose=? AND code_hash=? AND attempts<5').run(email, purpose, row.code_hash);
       return false;
     }
-    db.prepare('DELETE FROM email_codes WHERE email = ? AND purpose = ?').run(email, purpose);
-    return true;
+    return db.prepare('DELETE FROM email_codes WHERE email=? AND purpose=? AND code_hash=? AND expires_at>=? AND attempts<5')
+      .run(email, purpose, row.code_hash, now()).changes === 1;
   };
-  const saveScore = (challenge: Challenge) => {
+  const saveScore = (challenge: Pick<Challenge, 'id' | 'owner' | 'language' | 'difficulty' | 'duration' | 'nickname' | 'speed' | 'accuracy' | 'correct' | 'finished_at'>) => {
     db.prepare(`INSERT INTO scores(owner, language, difficulty, duration, nickname, speed, accuracy, correct, created_at, attempt_id)
       VALUES (@owner, @language, @difficulty, @duration, @nickname, @speed, @accuracy, @correct, @finished_at, @id)
       ON CONFLICT(owner, language, difficulty, duration) DO UPDATE SET
@@ -222,10 +227,24 @@ export async function createApp(options: AppOptions) {
       WHERE excluded.speed > scores.speed OR (excluded.speed = scores.speed AND excluded.accuracy > scores.accuracy)`)
       .run(challenge);
   };
-  const asAdmin = (request: FastifyRequest) => {
-    const user = userFor(request);
-    return user && adminEmail && user.email.toLowerCase() === adminEmail ? user : null;
-  };
+  await app.register(async (admin) => {
+    admin.decorateRequest('admin');
+    const authorize = async (request: FastifyRequest, reply: FastifyReply) => {
+      reply.header('Cache-Control', 'no-store');
+      const user = userFor(request);
+      if (!user || user.role !== 'admin') return invalid(reply, '没有管理权限', 403);
+      if (!accountMatches(request, user)) return invalid(reply, '登录账号已变更', 403);
+      request.admin = { id: user.id, username: user.username, authVersion: user.auth_version };
+    };
+    admin.addHook('onRequest', authorize);
+    admin.addHook('preHandler', authorize);
+    admin.setErrorHandler((error, _request, reply) => {
+      if (error instanceof AdminAccessError) return invalid(reply, error.message, error.statusCode);
+      return reply.send(error);
+    });
+    registerAdminRoutes(admin, { db, now, audit, publishedArticleCount: () => catalog.counts().published, saveScore });
+    registerCatalogRoutes(admin, catalog, audit);
+  }, { prefix: '/api/admin' });
 
   app.get('/api/health', async () => ({ ok: true }));
   app.get('/api/me', async (request) => {
@@ -238,8 +257,8 @@ export async function createApp(options: AppOptions) {
     const email = cleanEmail(body.email);
     const purpose = body.purpose;
     if (!emailPattern.test(email) || email.length > 254 || !['register', 'login', 'reset'].includes(String(purpose))) return invalid(reply, '请输入有效邮箱');
-    const existingUser = db.prepare('SELECT id FROM users WHERE email = ?').get(email);
-    if ((purpose === 'register' && existingUser) || (purpose !== 'register' && !existingUser)) return { ok: true };
+    const existingUser = db.prepare('SELECT disabled_at FROM users WHERE email = ?').get(email) as { disabled_at: number | null } | undefined;
+    if ((purpose === 'register' && existingUser) || (purpose !== 'register' && (!existingUser || existingUser.disabled_at !== null))) return { ok: true };
     const previous = db.prepare('SELECT created_at FROM email_codes WHERE email = ? AND purpose = ?').get(email, purpose) as { created_at: number } | undefined;
     if (previous && now() - previous.created_at < 60_000) return invalid(reply, '请稍后再获取验证码', 429);
     if (!options.mailer) return invalid(reply, '邮件服务尚未配置，请稍后再试', 503);
@@ -266,8 +285,16 @@ export async function createApp(options: AppOptions) {
     if (!emailPattern.test(email) || email.length > 254 || !/^[\p{L}\p{N}_-]{3,24}$/u.test(username) || password.length < 10 || password.length > 128) return invalid(reply, '用户名需为 3–24 位字母、数字或下划线，密码至少 10 位');
     if (db.prepare('SELECT id FROM users WHERE email = ? OR username = ?').get(email, username)) return invalid(reply, '账号信息不可用，请检查后重试', 409);
     if (!consumeCode(email, 'register', code)) return invalid(reply, '验证码错误或已过期');
-    const user: User = { id: randomUUID(), username, email, password_hash: await argon2.hash(password, { type: argon2.argon2id }) };
-    db.prepare('INSERT INTO users(id,username,email,password_hash,created_at) VALUES (?,?,?,?,?)').run(user.id, user.username, user.email, user.password_hash, now());
+    const passwordHash = await argon2.hash(password, { type: argon2.argon2id });
+    const user = db.transaction((): User | undefined => {
+      if (db.prepare('SELECT id FROM users WHERE email=? OR username=?').get(email, username)) return undefined;
+      const bootstrap = email === adminEmail && !db.prepare("SELECT 1 FROM users WHERE role='admin' LIMIT 1").get();
+      const account: User = { id: randomUUID(), username, email, password_hash: passwordHash, role: bootstrap ? 'admin' : 'user', auth_version: 0 };
+      db.prepare('INSERT INTO users(id,username,email,password_hash,role,created_at) VALUES (?,?,?,?,?,?)')
+        .run(account.id, account.username, account.email, account.password_hash, account.role, now());
+      return account;
+    }).immediate();
+    if (!user) return invalid(reply, '账号信息不可用，请检查后重试', 409);
     if (!startSession(reply, user)) return invalid(reply, '账号或密码不正确', 401);
     return { user: publicUser(user) };
   });
@@ -277,7 +304,7 @@ export async function createApp(options: AppOptions) {
     const identifier = typeof body.identifier === 'string' ? body.identifier.trim() : '';
     const password = typeof body.password === 'string' ? body.password : '';
     if (identifier.length > 254 || password.length > 128) return invalid(reply, '账号或密码不正确', 401);
-    const user = db.prepare('SELECT * FROM users WHERE username = ? OR email = ?').get(identifier, identifier.toLowerCase()) as User | undefined;
+    const user = db.prepare('SELECT * FROM users WHERE (username = ? OR email = ?) AND disabled_at IS NULL').get(identifier, identifier.toLowerCase()) as User | undefined;
     if (!user || !(await argon2.verify(user.password_hash, password))) return invalid(reply, '账号或密码不正确', 401);
     if (!startSession(reply, user)) return invalid(reply, '账号或密码不正确', 401);
     return { user: publicUser(user) };
@@ -287,7 +314,7 @@ export async function createApp(options: AppOptions) {
     const body = bodyOf(request);
     const email = cleanEmail(body.email);
     const code = typeof body.code === 'string' ? body.code : '';
-    const user = db.prepare('SELECT * FROM users WHERE email = ?').get(email) as User | undefined;
+    const user = db.prepare('SELECT * FROM users WHERE email = ? AND disabled_at IS NULL').get(email) as User | undefined;
     if (!user || !consumeCode(email, 'login', code)) return invalid(reply, '邮箱或验证码不正确', 401);
     if (!startSession(reply, user)) return invalid(reply, '邮箱或验证码不正确', 401);
     return { user: publicUser(user) };
@@ -298,14 +325,18 @@ export async function createApp(options: AppOptions) {
     const email = cleanEmail(body.email);
     const code = typeof body.code === 'string' ? body.code : '';
     const password = typeof body.password === 'string' ? body.password : '';
-    const user = db.prepare('SELECT * FROM users WHERE email = ?').get(email) as User | undefined;
+    const user = db.prepare('SELECT * FROM users WHERE email = ? AND disabled_at IS NULL').get(email) as User | undefined;
     if (!user || password.length < 10 || password.length > 128 || !consumeCode(email, 'reset', code)) return invalid(reply, '邮箱、验证码或新密码不正确');
     const hash = await argon2.hash(password, { type: argon2.argon2id });
-    db.transaction(() => {
-      db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(hash, user.id);
+    const reset = db.transaction(() => {
+      const changed = db.prepare('UPDATE users SET password_hash=?,auth_version=auth_version+1 WHERE id=? AND auth_version=? AND disabled_at IS NULL')
+        .run(hash, user.id, user.auth_version).changes;
+      if (!changed) return false;
       db.prepare('DELETE FROM sessions WHERE user_id = ?').run(user.id);
       db.prepare('DELETE FROM email_codes WHERE email = ?').run(email);
-    })();
+      return true;
+    }).immediate();
+    if (!reset) return invalid(reply, '邮箱、验证码或新密码不正确');
     reply.clearCookie('session', cookieOptions);
     return { ok: true };
   });
@@ -360,6 +391,11 @@ export async function createApp(options: AppOptions) {
     return db.prepare('SELECT * FROM challenges WHERE id=? AND owner=?').get(id, owner) as Challenge | undefined;
   };
 
+  app.get('/api/articles', async (_request, reply) => {
+    reply.header('Cache-Control', 'no-store');
+    return { articles: catalog.listPublic().map(({ content, ...article }) => ({ ...article, text: content, custom: false })) };
+  });
+
   app.post('/api/tests/start', async (request, reply) => {
     const expected = expectedAccount(request);
     if (expected !== undefined) {
@@ -368,11 +404,14 @@ export async function createApp(options: AppOptions) {
       if (expected !== (user?.id ?? 'guest')) return invalid(reply, '登录账号已变更', 403);
     }
     const body = bodyOf(request);
-    const article = articles.find((item) => item.id === body.articleId);
+    const article = catalog.findPublished(body.articleId);
     const duration = Number(body.duration);
     const mode = body.mode === undefined ? 'timed' : body.mode;
     const strict = body.strict === undefined ? false : body.strict;
     if (!article || !isValidDuration(duration)) return invalid(reply, '请选择有效文章和时长');
+    if (body.articleKey !== undefined && body.articleKey !== catalogSnapshotKey({ ...article, text: article.content, custom: false })) {
+      return invalid(reply, '文章已更新，请重新选择', 409);
+    }
     if (!isPracticeMode(mode) || typeof strict !== 'boolean') return invalid(reply, '练习模式无效');
     const owner = getOwner(request, reply)!;
     const target = article.content;
@@ -401,8 +440,9 @@ export async function createApp(options: AppOptions) {
     if (challenge.status !== 'active') return invalid(reply, '这次练习已经结束', 409);
     const elapsed = activeElapsed(challenge, time);
     if (elapsed > durationMs(challenge) + timingGraceMs(challenge)) return invalid(reply, '练习时间已结束', 409);
-    db.prepare("UPDATE challenges SET status='paused',elapsed_ms=?,active_started_at=NULL,pause_count=pause_count+1 WHERE id=?")
-      .run(elapsed, challenge.id);
+    const changed = db.prepare("UPDATE challenges SET status='paused',elapsed_ms=?,active_started_at=NULL,pause_count=pause_count+1 WHERE id=? AND status='active' AND active_started_at IS ? AND pause_count=?")
+      .run(elapsed, challenge.id, challenge.active_started_at, challenge.pause_count).changes;
+    if (!changed) return invalid(reply, '练习状态已变更', 409);
     return challengeTiming(challenge, time);
   });
 
@@ -412,7 +452,9 @@ export async function createApp(options: AppOptions) {
     if (challenge.status !== 'paused') return invalid(reply, '这次练习未暂停', 409);
     const time = now();
     if (challenge.elapsed_ms > durationMs(challenge) + timingGraceMs(challenge)) return invalid(reply, '练习时间已结束', 409);
-    db.prepare("UPDATE challenges SET status='active',active_started_at=? WHERE id=?").run(time, challenge.id);
+    const changed = db.prepare("UPDATE challenges SET status='active',active_started_at=? WHERE id=? AND status='paused' AND pause_count=?")
+      .run(time, challenge.id, challenge.pause_count).changes;
+    if (!changed) return invalid(reply, '练习状态已变更', 409);
     return challengeTiming(challenge, time);
   });
 
@@ -454,10 +496,12 @@ export async function createApp(options: AppOptions) {
     const interval = Math.max(0, Math.min(serverInterval, clientInterval) / 1000);
     const allowance = (challenge.language === 'zh' ? 8 : 32) * interval + 20;
     const flagged = challenge.activity_flag || growth > allowance ? 1 : 0;
-    db.prepare(`UPDATE challenges SET checkpoints=checkpoints+1,last_checkpoint_at=?,last_checkpoint_elapsed_ms=?,
+    const changed = db.prepare(`UPDATE challenges SET checkpoints=checkpoints+1,last_checkpoint_at=?,last_checkpoint_elapsed_ms=?,
       last_client_checkpoint_elapsed_ms=COALESCE(?,last_client_checkpoint_elapsed_ms),
-      missing_client_checkpoint_time=MAX(missing_client_checkpoint_time,?),last_correct=?,last_checkpoint_total=?,activity_flag=? WHERE id=?`)
-      .run(time, elapsed, clientElapsed, clientElapsed === null ? 1 : 0, correct, total, flagged, challenge.id);
+      missing_client_checkpoint_time=MAX(missing_client_checkpoint_time,?),last_correct=?,last_checkpoint_total=?,activity_flag=?
+      WHERE id=? AND status='active' AND pause_count=? AND checkpoints=?`)
+      .run(time, elapsed, clientElapsed, clientElapsed === null ? 1 : 0, correct, total, flagged, challenge.id, challenge.pause_count, challenge.checkpoints).changes;
+    if (!changed) return invalid(reply, '练习状态已变更', 409);
     return { ok: true };
   });
 
@@ -525,29 +569,41 @@ export async function createApp(options: AppOptions) {
     if (challenge.pause_count > 0) reasons.push('paused_session');
     if (clientTimed && (elapsed - elapsedMs > 3000 || challenge.missing_client_checkpoint_time)) reasons.push('timing_discrepancy');
     const status = reasons.length ? 'review' : 'finished';
-    db.prepare('UPDATE challenges SET finished_at=?,status=?,correct=?,total=?,accuracy=?,speed=?,review_reasons=?,elapsed_ms=?,active_started_at=NULL,backspaces=?,errors=?,typed=? WHERE id=?')
-      .run(time, status, score.correct, score.total, score.accuracy, speed, JSON.stringify(reasons), elapsedMs, backspaces, errors, typed, challenge.id);
+    const changed = db.prepare(`UPDATE challenges SET finished_at=?,status=?,correct=?,total=?,accuracy=?,speed=?,review_reasons=?,elapsed_ms=?,active_started_at=NULL,backspaces=?,errors=?,typed=?
+      WHERE id=? AND status=? AND published=0 AND pause_count=? AND checkpoints=?`)
+      .run(time, status, score.correct, score.total, score.accuracy, speed, JSON.stringify(reasons), elapsedMs, backspaces, errors, typed,
+        challenge.id, challenge.status, challenge.pause_count, challenge.checkpoints).changes;
+    if (!changed) {
+      const latest = findOwnedChallenge(request, reply);
+      const result = latest && settledResult(latest);
+      return result ?? invalid(reply, '练习状态已变更', 409);
+    }
     const eligible = score.correct > 0 && (challenge.mode !== 'article' || articleComplete);
     return { attemptId: challenge.id, score, status, eligible, elapsedMs };
   });
 
+  const publishScore = db.transaction((attemptId: string, owner: string, nickname: string) => {
+    const challenge = db.prepare('SELECT * FROM challenges WHERE id=? AND owner=?').get(attemptId, owner) as Challenge | undefined;
+    if (!challenge) return { error: '练习记录不存在', code: 404 } as const;
+    if (!['finished', 'review'].includes(challenge.status) || challenge.published) return { error: '这次成绩无法重复提交', code: 409 } as const;
+    if (!challenge.finished_at || now() - challenge.finished_at > 10 * 60_000 || !isEligible(challenge)) {
+      return { error: '成绩已过期或没有有效输入', code: 400 } as const;
+    }
+    db.prepare('UPDATE challenges SET nickname=?,published=1 WHERE id=?').run(nickname, challenge.id);
+    if (challenge.status === 'finished' && challenge.mode === 'timed' && !challenge.strict) saveScore({ ...challenge, nickname });
+    return { status: challenge.status === 'review' ? 'review' : 'ranked' } as const;
+  });
+
   app.post('/api/leaderboard', async (request, reply) => {
     const body = bodyOf(request);
-    const challenge = typeof body.attemptId === 'string' ? db.prepare('SELECT * FROM challenges WHERE id = ?').get(body.attemptId) as Challenge | undefined : undefined;
     const owner = getOwner(request, reply, false);
-    if (!challenge || !owner || challenge.owner !== owner) return invalid(reply, '练习记录不存在', 404);
-    if (!['finished', 'review'].includes(challenge.status) || challenge.published) return invalid(reply, '这次成绩无法重复提交', 409);
-    if (!challenge.finished_at || now() - challenge.finished_at > 10 * 60_000 || !isEligible(challenge)) return invalid(reply, '成绩已过期或没有有效输入');
+    if (typeof body.attemptId !== 'string' || !owner) return invalid(reply, '练习记录不存在', 404);
     const user = userFor(request);
     const nickname = user ? user.username : typeof body.nickname === 'string' ? body.nickname.trim() : '';
     const maxNicknameLength = user ? 24 : 16;
     if (splitCharacters(nickname).length < 1 || splitCharacters(nickname).length > maxNicknameLength || /[\p{Cc}\p{Cf}]/u.test(nickname)) return invalid(reply, `昵称需为 1–${maxNicknameLength} 个字符`);
-    db.transaction(() => {
-      db.prepare('UPDATE challenges SET nickname=?,published=1 WHERE id=?').run(nickname, challenge.id);
-      challenge.nickname = nickname;
-      if (challenge.status === 'finished' && challenge.mode === 'timed' && !challenge.strict) saveScore(challenge);
-    })();
-    return { status: challenge.status === 'review' ? 'review' : 'ranked' };
+    const result = publishScore.immediate(body.attemptId, owner, nickname);
+    return 'error' in result ? invalid(reply, result.error ?? '提交失败', result.code) : result;
   });
 
   app.get('/api/leaderboard', async (request, reply) => {
@@ -562,8 +618,7 @@ export async function createApp(options: AppOptions) {
     if (!['zh', 'en'].includes(language) || !difficulties.includes(difficulty as Difficulty) ||
       !['all', 'week', 'month'].includes(period) || !isPracticeMode(mode) || !['true', 'false'].includes(strict) ||
       (mode === 'timed' && !isValidDuration(duration)) ||
-      (articleId !== undefined && !articles.some((article) =>
-        article.id === articleId && article.language === language && article.difficulty === difficulty))) {
+      (articleId !== undefined && !catalog.hasHistorical(articleId, language as Language, difficulty as Difficulty))) {
       return invalid(reply, '请选择有效的排行榜');
     }
     const owner = getOwner(request, reply, false);
@@ -612,33 +667,6 @@ export async function createApp(options: AppOptions) {
     });
     reply.header('Cache-Control', 'no-store');
     return { entries };
-  });
-
-  app.get('/api/admin/review', async (request, reply) => {
-    if (!asAdmin(request)) return invalid(reply, '没有管理权限', 403);
-    const rows = db.prepare(`SELECT id,nickname,language,difficulty,duration,speed,accuracy,checkpoints,review_reasons AS reviewReasons,finished_at AS finishedAt FROM challenges WHERE status='review' AND published=1 ORDER BY finished_at DESC LIMIT 100`).all() as Array<Record<string, unknown> & { reviewReasons: string }>;
-    return { entries: rows.map(({ reviewReasons, ...row }) => ({ ...row, reasons: JSON.parse(reviewReasons) })) };
-  });
-  app.post('/api/admin/review/:id', async (request, reply) => {
-    if (!asAdmin(request)) return invalid(reply, '没有管理权限', 403);
-    const { id } = request.params as { id: string };
-    const action = bodyOf(request).action;
-    const challenge = db.prepare("SELECT * FROM challenges WHERE id=? AND status='review' AND published=1").get(id) as Challenge | undefined;
-    if (!challenge || !['approve', 'reject'].includes(String(action))) return invalid(reply, '记录或操作无效');
-    db.transaction(() => {
-      db.prepare('UPDATE challenges SET status=? WHERE id=?').run(action === 'approve' ? 'finished' : 'rejected', id);
-      if (action === 'approve' && challenge.mode === 'timed' && !challenge.strict) saveScore(challenge);
-    })();
-    return { ok: true };
-  });
-  app.post('/api/admin/remove/:id', async (request, reply) => {
-    if (!asAdmin(request)) return invalid(reply, '没有管理权限', 403);
-    const { id } = request.params as { id: string };
-    db.transaction(() => {
-      db.prepare('UPDATE challenges SET ranking_removed=1 WHERE id=?').run(id);
-      db.prepare('DELETE FROM scores WHERE attempt_id=?').run(id);
-    })();
-    return { ok: true };
   });
 
   if (options.staticRoot && existsSync(options.staticRoot)) {

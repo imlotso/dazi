@@ -1,12 +1,14 @@
 import { useCallback, useEffect, useRef, useState, type ChangeEvent, type CompositionEvent, type KeyboardEvent } from 'react';
 import type { Difficulty, Language } from '../data/articles';
-import { api } from '../lib/api';
-import { snapshotKey, type ArticleSnapshot, type MistakeSample, type PracticeMode, type PracticeRecord, type SavedPractice } from '../lib/models';
+import { api, ApiError } from '../lib/api';
+import { catalogSnapshotKey, snapshotKey, type ArticleSnapshot, type MistakeSample, type PracticeMode, type PracticeRecord, type SavedPractice } from '../lib/models';
 import { scoreTyping, splitCharacters, type Score } from '../lib/scoring';
 
 export type PracticePhase = 'ready' | 'starting' | 'running' | 'pausing' | 'paused' | 'resuming' | 'restoring' | 'finishing' | 'finished';
 type RoundConfig = { articleId: string; title: string; text: string; language: Language; difficulty: Difficulty; duration: number; custom: boolean; ownerId: string | null; article?: ArticleSnapshot; mode?: PracticeMode; strict?: boolean };
 export type PracticeConfig = RoundConfig & {
+  guardCatalog?: boolean;
+  onCatalogStale?: () => void;
   autoPause?: boolean;
   onRecord?: (record: PracticeRecord) => void;
   onDraft?: (draft: SavedPractice) => void;
@@ -209,7 +211,8 @@ export function usePractice(config: PracticeConfig, initialDraft: PracticeDraft 
   const initialPhase: PracticePhase = draft ? (draft.completed || (draft.id && !draft.offline) ? 'restoring' : 'paused') : 'ready';
   const [phase, setPhase] = useState<PracticePhase>(initialPhase);
   const phaseRef = useRef<PracticePhase>(initialPhase);
-  const [target, setTarget] = useState(draft?.target ?? config.text);
+  const [storedTarget, setTarget] = useState(draft?.target ?? config.text);
+  const target = phase === 'ready' ? config.text : storedTarget;
   const targetCharacters = useRef<string[] | null>(null);
   const [raw, setRaw] = useState(draft?.typed ?? '');
   const [typed, setTyped] = useState(draft?.typed ?? '');
@@ -481,11 +484,17 @@ export function usePractice(config: PracticeConfig, initialDraft: PracticeDraft 
     if (!custom) {
       try {
         const challenge = await api<{ id: string; target: string }>('/api/tests/start', {
-          method: 'POST', headers: { 'X-Workspace-Owner': ownerId ?? 'guest' }, body: { articleId, duration, mode, strict },
+          method: 'POST', headers: { 'X-Workspace-Owner': ownerId ?? 'guest' }, body: {
+            articleId, duration, mode, strict,
+            ...(config.guardCatalog && article ? { articleKey: catalogSnapshotKey(article) } : {}),
+          },
         });
         if (typeof challenge.id !== 'string' || !validAttemptId(challenge.id) || typeof challenge.target !== 'string' || !challenge.target || challenge.target.length > maxTextLength) throw new Error('练习数据无效');
         id = challenge.id; testTarget = challenge.target;
-      } catch { offline = true; }
+      } catch (error) {
+        if (config.guardCatalog && error instanceof ApiError && (error.status === 409 || error.status === 400)) config.onCatalogStale?.();
+        offline = true;
+      }
     }
     if (!current()) {
       if (mounted.current && startRequest.current === request) setCurrentPhase('ready');

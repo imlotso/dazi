@@ -19,7 +19,7 @@ const mode = z.enum(['timed', 'article']);
 const source = z.object({
   name: z.string().min(1).max(300),
   url: z.url({ protocol: /^https?$/ }).max(2048),
-  license: z.literal('public-domain'),
+  license: z.enum(['public-domain', 'reusable']),
 });
 const snapshot = z.object({
   id, title: z.string().min(1).max(200), text: z.string().min(1).max(30_000),

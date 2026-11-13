@@ -4,7 +4,7 @@ import { enPassages } from './en-library';
 export const difficulties = ['beginner', 'intermediate', 'advanced'] as const;
 export type Difficulty = typeof difficulties[number];
 export type Language = 'zh' | 'en';
-export type ArticleSource = { name: string; url: string; license: 'public-domain' };
+export type ArticleSource = { name: string; url: string; license: 'public-domain' | 'reusable' };
 export type Passage = { title: string; content: string; author: string; theme: string; source: ArticleSource };
 export type Article = Passage & { id: string; language: Language; difficulty: Difficulty };
 
