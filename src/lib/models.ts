@@ -46,3 +46,9 @@ export function snapshotKey(article: ArticleSnapshot) {
   for (let i = 0; i < article.text.length; i++) hash = Math.imul(hash ^ article.text.charCodeAt(i), 16777619);
   return `${article.id}:${(hash >>> 0).toString(16)}`;
 }
+
+// A catalog edit should not silently replace the selected text or its attribution.
+export function catalogSnapshotKey(article: ArticleSnapshot) {
+  return JSON.stringify([snapshotKey(article), article.title, article.language, article.difficulty, article.author,
+    article.theme, article.source?.name, article.source?.url, article.source?.license]);
+}

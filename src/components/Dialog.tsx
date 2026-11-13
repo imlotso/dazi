@@ -20,18 +20,24 @@ export function Dialog({ title, onClose, children, className = '', dismissible =
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === 'Escape') { event.preventDefault(); closeRef.current(); return; }
       if (event.key !== 'Tab' || !element) return;
-      const items = [...element.querySelectorAll<HTMLElement>('button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), a[href]')];
-      if (!items.length) return;
+      const items = [...element.querySelectorAll<HTMLElement>('button, input, select, textarea, a[href]')]
+        .filter((item) => !item.matches(':disabled, [hidden], input[type="hidden"]'));
+      if (!items.length) {
+        event.preventDefault();
+        element.focus();
+        return;
+      }
       const first = items[0];
       const last = items[items.length - 1];
-      if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+      if (!items.includes(document.activeElement as HTMLElement)) { event.preventDefault(); (event.shiftKey ? last : first).focus(); }
+      else if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
       else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
     };
     document.addEventListener('keydown', onKeyDown);
     return () => { document.removeEventListener('keydown', onKeyDown); previous?.focus(); };
   }, [portalTarget]);
   return createPortal(<div className="dialog-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) closeRef.current(); }}>
-    <div ref={dialog} className={`dialog ${className}`} role="dialog" aria-modal="true" aria-labelledby={titleId}>
+    <div ref={dialog} className={`dialog ${className}`} tabIndex={-1} role="dialog" aria-modal="true" aria-labelledby={titleId}>
       <div className="dialog-heading"><h2 id={titleId}>{title}</h2><button className="icon-button" aria-label="关闭" disabled={!dismissible} onClick={onClose}><X size={22} /></button></div>
       {children}
     </div>

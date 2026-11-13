@@ -7,7 +7,7 @@ export const MAX_PRIVATE_BYTES = 100_000;
 
 const englishWordPattern = /\p{Script=Latin}+(?:['’\-]\p{Script=Latin}+)*/gu;
 
-export function articleLength(article: ArticleSnapshot) {
+export function articleLength(article: Pick<ArticleSnapshot, 'language' | 'text'>) {
   const pattern = article.language === 'zh' ? /\p{Script=Han}/gu : englishWordPattern;
   return (article.text.match(pattern) ?? []).length;
 }

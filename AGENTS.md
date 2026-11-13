@@ -14,6 +14,8 @@ Article mood preference (confirmed 2026-11-14): include both warm/healing storie
 
 Custom backgrounds (2026-11-14): provide a complete user workflow, including image selection/drop, preview, display adjustments, replacement, restoring the original background, persistent local storage and account-scoped synchronization. Preserve readable controls and the established visual identity around user images. Verify the feature and CI before merging to main.
 
+Admin console (2026-11-14): implement actual dashboard, user and administrator role management, public article management, score moderation, and audit logs. Keep account access changes transactional and revoke affected sessions. Preserve historical article snapshots and keep private practice content and background images out of admin endpoints.
+
 Practice must default to five minutes, accept whole-minute durations from 1 through 60, and finish immediately when the selected article is fully entered. Preserve unfinished progress locally, support pause and resume, handle Chinese IME composition correctly, calculate speed from active time, and display article length, entered characters, errors, and backspace count.
 
 Run the local server yourself and open the preview in the browser available to this environment. Do not give the user server-start instructions when you can run it.

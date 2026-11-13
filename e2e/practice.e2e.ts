@@ -1,4 +1,5 @@
-import { expect, test } from '@playwright/test';
+import { expect, test, type APIRequestContext } from '@playwright/test';
+import { articles } from '../src/data/articles';
 
 test('selects language and difficulty and validates the 1–60 minute limit', async ({ page }) => {
   await page.goto('/');
@@ -174,13 +175,110 @@ test('submits an online result, registers an admin with a test email and publish
   await page.reload();
   await expect(page.getByTitle('退出登录')).toContainText('ci_admin');
 
-  await page.getByRole('button', { name: '审核', exact: true }).click();
+  await page.getByRole('button', { name: '管理后台', exact: true }).click();
+  await page.getByRole('button', { name: '成绩', exact: true }).click();
   const row = page.locator('li').filter({ hasText: 'CI 访客' });
   await expect(row).toBeVisible();
-  await row.getByRole('button', { name: '通过' }).click();
+  await row.getByRole('button', { name: '通过', exact: true }).click();
+  const approval = page.getByRole('dialog', { name: '通过成绩' });
+  await expect(approval.getByRole('button', { name: '确认通过' })).toBeDisabled();
+  await approval.getByRole('textbox', { name: '原因' }).fill('核对练习记录');
+  await approval.getByRole('button', { name: '确认通过' }).click();
   await expect(row).toHaveCount(0);
   await page.getByRole('button', { name: '排行榜', exact: true }).click();
   const ranked = page.locator('li').filter({ hasText: 'CI 访客' });
   await expect(ranked.locator('strong')).toHaveText(`${expectedSpeed} 字/分`);
   await expect(ranked).toContainText('100%');
+});
+
+const password = 'ci-password-123';
+
+async function register(request: APIRequestContext, username: string, email = username + '@example.test') {
+  expect((await request.post('/api/auth/code', { data: { email, purpose: 'register' } })).ok()).toBe(true);
+  const { code } = await (await request.get('/__e2e__/email-code', { params: { email, purpose: 'register' } })).json();
+  expect((await request.post('/api/auth/register', { data: { username, email, password, code } })).ok()).toBe(true);
+}
+
+test('manages a live account and publishes a sourced article into the practice catalog', async ({ page, browser }) => {
+  const readerContext = await browser.newContext({ baseURL: test.info().project.use.baseURL });
+  const reader = await readerContext.newPage();
+  await register(reader.request, 'admin_e2e_reader');
+  await reader.goto('/');
+  await expect(reader.getByRole('button', { name: '管理后台', exact: true })).toHaveCount(0);
+  expect((await reader.request.get('/api/admin/overview')).status()).toBe(403);
+  const owner = await page.request.post('/api/auth/login', { data: { identifier: 'admin@example.test', password } });
+  if (!owner.ok()) await register(page.request, 'ci_admin', 'admin@example.test');
+  expect((await page.request.post('/api/auth/logout', { data: {} })).ok()).toBe(true);
+  await page.goto('/admin');
+  const login = page.getByRole('dialog', { name: '登录' });
+  await login.getByLabel('用户名或邮箱').fill('ci_admin');
+  await login.getByLabel('密码', { exact: true }).fill(password);
+  await login.getByRole('button', { name: '登录', exact: true }).click();
+  await expect(page.getByText('已发布文章', { exact: true })).toBeVisible();
+
+  await page.getByRole('button', { name: '用户', exact: true }).click();
+  await page.getByRole('searchbox', { name: '用户名或邮箱' }).fill('admin_e2e_reader');
+  await page.getByRole('button', { name: '搜索', exact: true }).click();
+  await page.getByRole('button', { name: 'admin_e2e_reader 详情' }).click();
+  const details = page.getByRole('dialog', { name: '用户详情' });
+  await expect(details.getByText('admin_e2e_reader@example.test')).toBeVisible();
+  await details.getByRole('button', { name: '停用', exact: true }).click();
+  const disable = page.getByRole('dialog', { name: '停用账号' });
+  await disable.getByRole('textbox', { name: '原因' }).fill('账户操作验证');
+  await disable.getByRole('button', { name: '确认停用' }).click();
+  await expect(disable).toHaveCount(0);
+  expect((await (await reader.request.get('/api/me')).json()).user).toBeNull();
+
+  await page.getByRole('button', { name: 'admin_e2e_reader 详情' }).click();
+  await details.getByRole('button', { name: '启用', exact: true }).click();
+  const enable = page.getByRole('dialog', { name: '启用账号' });
+  await enable.getByRole('textbox', { name: '原因' }).fill('账户操作验证完成');
+  await enable.getByRole('button', { name: '确认启用' }).click();
+  await expect(enable).toHaveCount(0);
+  expect((await reader.request.post('/api/auth/login', { data: { identifier: 'admin_e2e_reader', password } })).ok()).toBe(true);
+  await page.getByRole('button', { name: 'admin_e2e_reader 详情' }).click();
+  await details.getByRole('button', { name: '退出所有会话', exact: true }).click();
+  const revoke = page.getByRole('dialog', { name: '退出所有会话' });
+  await revoke.getByRole('textbox', { name: '原因' }).fill('会话撤销验证');
+  await revoke.getByRole('button', { name: '确认退出', exact: true }).click();
+  await expect(revoke).toHaveCount(0);
+  expect((await (await reader.request.get('/api/me')).json()).user).toBeNull();
+  await details.getByRole('button', { name: '关闭' }).click();
+
+  await page.getByRole('button', { name: '文章', exact: true }).click();
+  await page.getByRole('button', { name: '新建文章', exact: true }).click();
+  const editor = page.getByRole('dialog', { name: '新建文章' });
+  const passage = articles.find((article) => article.id === 'zh-beginner-2')!;
+  // Keep the published seed body distinct in the test database.
+  const body = passage.content.slice(0, -1);
+  await editor.getByLabel('标题', { exact: true }).fill('浏览器验证文章');
+  await editor.getByLabel('作者', { exact: true }).fill(passage.author);
+  await editor.getByLabel('主题', { exact: true }).fill(passage.theme);
+  await editor.getByLabel('正文', { exact: true }).fill(body);
+  await editor.getByLabel('来源名称', { exact: true }).fill(passage.source.name);
+  await editor.getByLabel('原文链接', { exact: true }).fill(passage.source.url);
+  await editor.getByRole('button', { name: '保存', exact: true }).click();
+  await expect(editor).toHaveCount(0);
+  await page.getByRole('button', { name: '编辑《浏览器验证文章》' }).click();
+  await page.getByRole('button', { name: '发布', exact: true }).click();
+  await page.getByRole('dialog', { name: '发布文章' }).getByRole('button', { name: '确认发布' }).click();
+  await expect(page.getByRole('dialog')).toHaveCount(0);
+
+  await reader.reload();
+  await reader.getByRole('button', { name: '文章库', exact: true }).click();
+  await reader.getByRole('searchbox', { name: '搜索' }).fill('浏览器验证文章');
+  await reader.getByRole('button', { name: '练习《浏览器验证文章》' }).click();
+  const started = reader.waitForResponse((response) => response.url().endsWith('/api/tests/start') && response.request().method() === 'POST');
+  await reader.getByRole('button', { name: '开始练习', exact: true }).click();
+  const challenge = await started;
+  expect(challenge.status()).toBe(200);
+  expect((await challenge.json()).target).toBe(body.trim());
+
+  await page.getByRole('button', { name: '切换至夜间模式' }).click();
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.getByRole('button', { name: '操作日志', exact: true }).click();
+  await expect(page.getByRole('heading', { name: '发布文章 · 浏览器验证文章' })).toBeVisible();
+  await expect(page.getByText('账户操作验证完成', { exact: true })).toBeVisible();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(390);
+  await readerContext.close();
 });
