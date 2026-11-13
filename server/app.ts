@@ -8,6 +8,8 @@ import { createHash, createHmac, randomBytes, randomInt, randomUUID, timingSafeE
 import { existsSync } from 'node:fs';
 import { articles, difficulties, type Difficulty, type Language } from '../src/data/articles';
 import { scoreTyping, splitCharacters } from '../src/lib/scoring';
+import type { ArticleSnapshot, PracticeMode, RankingEntry } from '../src/lib/models';
+import { createWorkspaceStore, syncBodyLimit, validateWorkspaceItems, WorkspaceLimitError } from './workspace';
 
 export type Mailer = { sendCode(email: string, code: string, purpose: string): Promise<void> };
 export type AppOptions = {
@@ -33,13 +35,22 @@ type Challenge = {
   last_checkpoint_elapsed_ms: number | null; last_client_checkpoint_elapsed_ms: number | null;
   missing_client_checkpoint_time: number; last_checkpoint_total: number;
   backspaces: number; errors: number;
+  article_id: string | null; article_metadata: string | null; typed: string | null;
+  mode: PracticeMode; strict: number; ranking_removed: number;
 };
 type Input = Record<string, unknown>;
 
 const digest = (value: string) => createHash('sha256').update(value).digest('hex');
 const emailPattern = /^[^\s@]{1,64}@[^\s@.]+(?:\.[^\s@.]+)+$/;
 const isValidDuration = (duration: number) => Number.isInteger(duration) && duration >= 60 && duration <= 3600 && duration % 60 === 0;
-const durationMs = (challenge: Challenge) => challenge.duration * 1000;
+const durationMs = (challenge: Challenge) => challenge.mode === 'article' ? 24 * 60 * 60_000 : challenge.duration * 1000;
+const isPracticeMode = (mode: unknown): mode is PracticeMode => mode === 'timed' || mode === 'article';
+const isEligible = (challenge: Challenge) => (challenge.correct ?? 0) > 0 &&
+  (challenge.mode !== 'article' || (
+    challenge.total === splitCharacters(challenge.target).length && (!challenge.strict || challenge.correct === challenge.total)
+  ));
+const hasStrictProgress = (expected: string[], actual: string[]) =>
+  actual.every((character, index) => character === expected[index] || index === actual.length - 1);
 // Each pause cycle adds two network legs. Keep the extra allowance bounded.
 const timingGraceMs = (challenge: Challenge) => 20_000 + Math.min(120_000, challenge.pause_count * 24_000);
 const activeElapsed = (challenge: Challenge, time: number) =>
@@ -58,7 +69,7 @@ const settledResult = (challenge: Challenge) => {
     attemptId: challenge.id,
     score: { correct, total, accuracy: challenge.accuracy ?? 0, cpm: Math.round(cpm * 100) / 100, wpm: Math.round(cpm / 5 * 100) / 100 },
     status: challenge.status,
-    eligible: correct > 0,
+    eligible: isEligible(challenge),
     elapsedMs: challenge.elapsed_ms,
   };
 };
@@ -119,6 +130,12 @@ export async function createApp(options: AppOptions) {
       ['last_checkpoint_total', 'INTEGER NOT NULL DEFAULT 0'],
       ['backspaces', 'INTEGER NOT NULL DEFAULT 0'],
       ['errors', 'INTEGER NOT NULL DEFAULT 0'],
+      ['article_id', 'TEXT'],
+      ['article_metadata', 'TEXT'],
+      ['typed', 'TEXT'],
+      ['mode', "TEXT NOT NULL DEFAULT 'timed'"],
+      ['strict', 'INTEGER NOT NULL DEFAULT 0'],
+      ['ranking_removed', 'INTEGER NOT NULL DEFAULT 0'],
     ]) {
       if (!challengeColumns.has(name)) db.exec(`ALTER TABLE challenges ADD COLUMN ${name} ${definition}`);
     }
@@ -131,7 +148,17 @@ export async function createApp(options: AppOptions) {
     if (!challengeColumns.has('last_checkpoint_elapsed_ms')) {
       db.exec('UPDATE challenges SET last_checkpoint_elapsed_ms=MAX(0,last_checkpoint_at-started_at) WHERE last_checkpoint_at IS NOT NULL');
     }
+    if (!challengeColumns.has('ranking_removed')) {
+      // Legacy removals only deleted the best score row. Published attempts without
+      // a score row are ambiguous, so preserve the visible legacy rankings.
+      db.exec(`UPDATE challenges SET ranking_removed=1 WHERE published=1 AND status='finished'
+        AND NOT EXISTS (SELECT 1 FROM scores WHERE scores.attempt_id=challenges.id)`);
+    }
+    db.exec(`CREATE INDEX IF NOT EXISTS challenges_rank
+      ON challenges(language, difficulty, mode, strict, finished_at)
+      WHERE published=1 AND status='finished' AND ranking_removed=0`);
   })();
+  const workspace = createWorkspaceStore(db);
 
   const app = Fastify({ logger: false, bodyLimit: 128 * 1024, trustProxy: options.trustProxy ?? false });
   await app.register(cookie);
@@ -150,6 +177,9 @@ export async function createApp(options: AppOptions) {
     if (!token || token.length > 100) return undefined;
     return db.prepare('SELECT u.* FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token_hash = ? AND s.expires_at > ?').get(digest(token), now()) as User | undefined;
   };
+  const expectedAccount = (request: FastifyRequest) => request.headers['x-workspace-owner'];
+  const accountMatches = (request: FastifyRequest, user: User) =>
+    expectedAccount(request) === undefined || expectedAccount(request) === user.id;
   const publicUser = (user: User) => ({ id: user.id, username: user.username, email: user.email, isAdmin: !!adminEmail && user.email.toLowerCase() === adminEmail });
   const startSession = (reply: FastifyReply, user: User) => {
     const token = randomBytes(32).toString('base64url');
@@ -286,6 +316,43 @@ export async function createApp(options: AppOptions) {
     return { ok: true };
   });
 
+  function workspaceResponse(request: FastifyRequest, owner: string, serverTime: number) {
+    const items = workspace.get(owner);
+    const known = request.headers['x-workspace-backgrounds'];
+    if (typeof known !== 'string') return { items, serverTime };
+    const backgrounds = items.filter((item) => item.kind === 'background');
+    const version = createHash('sha256').update(owner).update(JSON.stringify(backgrounds)).digest('hex');
+    const unchanged = known === version;
+    return {
+      items: unchanged ? items.filter((item) => item.kind !== 'background') : items,
+      serverTime, backgroundsVersion: version, backgroundsUnchanged: unchanged,
+    };
+  }
+
+  app.get('/api/workspace', async (request, reply) => {
+    const user = userFor(request);
+    if (!user) return invalid(reply, '请先登录', 401);
+    if (!accountMatches(request, user)) return invalid(reply, '登录账号已变更', 403);
+    reply.header('Cache-Control', 'no-store');
+    return workspaceResponse(request, user.id, now());
+  });
+
+  app.post('/api/workspace/sync', { bodyLimit: syncBodyLimit }, async (request, reply) => {
+    const user = userFor(request);
+    if (!user) return invalid(reply, '请先登录', 401);
+    if (!accountMatches(request, user)) return invalid(reply, '登录账号已变更', 403);
+    const serverTime = now();
+    const items = validateWorkspaceItems(bodyOf(request).items, user.id, serverTime);
+    if (!items) return invalid(reply, '同步数据无效');
+    try { workspace.merge(user.id, items); }
+    catch (error) {
+      if (error instanceof WorkspaceLimitError) return invalid(reply, '同步空间已满', 413);
+      throw error;
+    }
+    reply.header('Cache-Control', 'no-store');
+    return workspaceResponse(request, user.id, serverTime);
+  });
+
   const findOwnedChallenge = (request: FastifyRequest, reply: FastifyReply) => {
     const { id } = request.params as { id: string };
     const owner = getOwner(request, reply, false);
@@ -294,16 +361,28 @@ export async function createApp(options: AppOptions) {
   };
 
   app.post('/api/tests/start', async (request, reply) => {
+    const expected = expectedAccount(request);
+    if (expected !== undefined) {
+      const user = userFor(request);
+      if (!user && expected !== 'guest') return invalid(reply, '请先登录', 401);
+      if (expected !== (user?.id ?? 'guest')) return invalid(reply, '登录账号已变更', 403);
+    }
     const body = bodyOf(request);
     const article = articles.find((item) => item.id === body.articleId);
     const duration = Number(body.duration);
+    const mode = body.mode === undefined ? 'timed' : body.mode;
+    const strict = body.strict === undefined ? false : body.strict;
     if (!article || !isValidDuration(duration)) return invalid(reply, '请选择有效文章和时长');
+    if (!isPracticeMode(mode) || typeof strict !== 'boolean') return invalid(reply, '练习模式无效');
     const owner = getOwner(request, reply)!;
     const target = article.content;
     const id = randomUUID();
     const startedAt = now();
-    db.prepare('INSERT INTO challenges(id,owner,language,difficulty,duration,target,started_at,active_started_at) VALUES (?,?,?,?,?,?,?,?)')
-      .run(id, owner, article.language, article.difficulty, duration, target, startedAt, startedAt);
+    const { content, ...articleMetadata } = article;
+    db.prepare(`INSERT INTO challenges(id,owner,language,difficulty,duration,target,started_at,active_started_at,article_id,article_metadata,mode,strict)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`)
+      .run(id, owner, article.language, article.difficulty, duration, content, startedAt, startedAt, article.id,
+        JSON.stringify({ ...articleMetadata, custom: false }), mode, Number(strict));
     return { id, target, duration };
   });
 
@@ -355,11 +434,14 @@ export async function createApp(options: AppOptions) {
       clientElapsed = Math.round(reported);
     }
     if (elapsed > durationMs(challenge) + 5000) return invalid(reply, '练习时间无效');
+    const typed = body.typed;
+    if (typeof typed !== 'string') return invalid(reply, '输入内容无效');
+    const actual = splitCharacters(typed);
+    const expected = splitCharacters(challenge.target);
+    if (actual.length > expected.length || (challenge.strict && !hasStrictProgress(expected, actual))) return invalid(reply, '输入内容无效');
     if (elapsed > durationMs(challenge)) return { ok: true };
     const lastSampleElapsed = challenge.last_checkpoint_elapsed_ms;
     if (lastSampleElapsed !== null && elapsed - lastSampleElapsed < 2000) return invalid(reply, '提交过于频繁', 429);
-    const typed = body.typed;
-    if (typeof typed !== 'string' || splitCharacters(typed).length > splitCharacters(challenge.target).length) return invalid(reply, '输入内容无效');
     const { correct, total } = scoreTyping(challenge.target, typed, elapsed / 1000);
     const lastClientElapsed = challenge.last_client_checkpoint_elapsed_ms;
     const growth = correct - challenge.last_correct;
@@ -399,14 +481,21 @@ export async function createApp(options: AppOptions) {
       }
       elapsedMs = Math.round(reported);
     }
-    if (elapsedMs < 1000 || elapsed > limit + timingGraceMs(challenge) || (!paused && body.early !== true && elapsedMs < limit)) {
+    if (elapsedMs < 1000 || elapsed > limit + timingGraceMs(challenge) ||
+      (challenge.mode === 'timed' && !paused && body.early !== true && elapsedMs < limit)) {
       return invalid(reply, '测试时间无效，成绩无法上榜');
     }
     const typed = typeof body.typed === 'string' ? body.typed.normalize('NFC') : '';
-    const typedLength = splitCharacters(typed).length;
-    const targetLength = splitCharacters(challenge.target).length;
+    const actual = splitCharacters(typed);
+    const expected = splitCharacters(challenge.target);
+    const typedLength = actual.length;
+    const targetLength = expected.length;
     if (typedLength > targetLength) return invalid(reply, '输入内容超过文章长度');
-    if (!paused && elapsedMs < limit && typedLength < targetLength) return invalid(reply, '请先完成当前文章');
+    const correctLast = !challenge.strict || actual.at(-1) === expected.at(-1);
+    const articleComplete = typedLength === targetLength && correctLast;
+    const requiresCompletion = !paused && (challenge.mode === 'article' || elapsedMs < limit);
+    if (challenge.strict && !hasStrictProgress(expected, actual)) return invalid(reply, '请先纠正输入');
+    if (requiresCompletion && !articleComplete) return invalid(reply, '请先完成当前文章');
     const backspaces = body.backspaces ?? 0;
     if (typeof backspaces !== 'number' || !Number.isSafeInteger(backspaces) || backspaces < 0) return invalid(reply, '退格次数无效');
 
@@ -436,9 +525,10 @@ export async function createApp(options: AppOptions) {
     if (challenge.pause_count > 0) reasons.push('paused_session');
     if (clientTimed && (elapsed - elapsedMs > 3000 || challenge.missing_client_checkpoint_time)) reasons.push('timing_discrepancy');
     const status = reasons.length ? 'review' : 'finished';
-    db.prepare('UPDATE challenges SET finished_at=?,status=?,correct=?,total=?,accuracy=?,speed=?,review_reasons=?,elapsed_ms=?,active_started_at=NULL,backspaces=?,errors=? WHERE id=?')
-      .run(time, status, score.correct, score.total, score.accuracy, speed, JSON.stringify(reasons), elapsedMs, backspaces, errors, challenge.id);
-    return { attemptId: challenge.id, score, status, eligible: score.correct > 0, elapsedMs };
+    db.prepare('UPDATE challenges SET finished_at=?,status=?,correct=?,total=?,accuracy=?,speed=?,review_reasons=?,elapsed_ms=?,active_started_at=NULL,backspaces=?,errors=?,typed=? WHERE id=?')
+      .run(time, status, score.correct, score.total, score.accuracy, speed, JSON.stringify(reasons), elapsedMs, backspaces, errors, typed, challenge.id);
+    const eligible = score.correct > 0 && (challenge.mode !== 'article' || articleComplete);
+    return { attemptId: challenge.id, score, status, eligible, elapsedMs };
   });
 
   app.post('/api/leaderboard', async (request, reply) => {
@@ -447,7 +537,7 @@ export async function createApp(options: AppOptions) {
     const owner = getOwner(request, reply, false);
     if (!challenge || !owner || challenge.owner !== owner) return invalid(reply, '练习记录不存在', 404);
     if (!['finished', 'review'].includes(challenge.status) || challenge.published) return invalid(reply, '这次成绩无法重复提交', 409);
-    if (!challenge.finished_at || now() - challenge.finished_at > 10 * 60_000 || !challenge.correct) return invalid(reply, '成绩已过期或没有有效输入');
+    if (!challenge.finished_at || now() - challenge.finished_at > 10 * 60_000 || !isEligible(challenge)) return invalid(reply, '成绩已过期或没有有效输入');
     const user = userFor(request);
     const nickname = user ? user.username : typeof body.nickname === 'string' ? body.nickname.trim() : '';
     const maxNicknameLength = user ? 24 : 16;
@@ -455,27 +545,72 @@ export async function createApp(options: AppOptions) {
     db.transaction(() => {
       db.prepare('UPDATE challenges SET nickname=?,published=1 WHERE id=?').run(nickname, challenge.id);
       challenge.nickname = nickname;
-      if (challenge.status === 'finished') saveScore(challenge);
+      if (challenge.status === 'finished' && challenge.mode === 'timed' && !challenge.strict) saveScore(challenge);
     })();
     return { status: challenge.status === 'review' ? 'review' : 'ranked' };
   });
 
   app.get('/api/leaderboard', async (request, reply) => {
+    if (expectedAccount(request) !== undefined) {
+      const user = userFor(request);
+      if (!user) return invalid(reply, '请先登录', 401);
+      if (!accountMatches(request, user)) return invalid(reply, '登录账号已变更', 403);
+    }
     const query = request.query as Record<string, string>;
-    const language = query.language;
-    const difficulty = query.difficulty;
+    const { language, difficulty, period = 'all', articleId, mode = 'timed', strict = 'false' } = query;
     const duration = Number(query.duration);
-    if (!['zh', 'en'].includes(language) || !difficulties.includes(difficulty as Difficulty) || !isValidDuration(duration)) return invalid(reply, '请选择有效的排行榜');
-    const entries = db.prepare(`SELECT nickname, speed, accuracy, attempt_id AS attemptId, created_at AS createdAt, CASE WHEN owner LIKE 'g:%' THEN 1 ELSE 0 END AS guest
-      FROM scores WHERE language=? AND difficulty=? AND duration=? ORDER BY speed DESC, accuracy DESC, created_at ASC LIMIT 100`).all(language, difficulty, duration);
-    return { entries };
+    if (!['zh', 'en'].includes(language) || !difficulties.includes(difficulty as Difficulty) ||
+      !['all', 'week', 'month'].includes(period) || !isPracticeMode(mode) || !['true', 'false'].includes(strict) ||
+      (mode === 'timed' && !isValidDuration(duration)) ||
+      (articleId !== undefined && !articles.some((article) =>
+        article.id === articleId && article.language === language && article.difficulty === difficulty))) {
+      return invalid(reply, '请选择有效的排行榜');
+    }
+    const owner = getOwner(request, reply, false);
+    const since = period === 'all' ? 0 : now() - (period === 'week' ? 7 : 30) * 86_400_000;
+    const rows = db.prepare(`
+      WITH candidates AS (
+        SELECT id, owner, nickname, speed, accuracy, finished_at, article_id,
+          ROW_NUMBER() OVER (PARTITION BY owner ORDER BY speed DESC, accuracy DESC, finished_at, id) AS owner_rank
+        FROM challenges
+        WHERE published=1 AND status='finished' AND ranking_removed=0 AND language=@language
+          AND difficulty=@difficulty AND mode=@mode AND strict=@strict AND finished_at>=@since
+          AND nickname IS NOT NULL AND speed IS NOT NULL
+          AND (@duration IS NULL OR duration=@duration) AND (@articleId IS NULL OR article_id=@articleId)
+      ), ranked AS (
+        SELECT owner, nickname, speed, accuracy, id AS attemptId, finished_at AS createdAt, article_id AS articleId,
+          CASE WHEN owner LIKE 'g:%' THEN 1 ELSE 0 END AS guest,
+          ROW_NUMBER() OVER (ORDER BY speed DESC, accuracy DESC, finished_at, id) AS rank,
+          COUNT(*) OVER () AS total
+        FROM candidates WHERE owner_rank=1
+      )
+      SELECT * FROM ranked WHERE rank<=100 OR owner=@owner ORDER BY rank
+    `).all({
+      language, difficulty, mode, strict: Number(strict === 'true'), since, owner,
+      duration: mode === 'timed' ? duration : null, articleId: articleId ?? null,
+    }) as Array<Omit<RankingEntry, 'articleId'> & { owner: string; total: number; rank: number; articleId: string | null }>;
+    const entries = rows.map(({ owner: rowOwner, total: _total, articleId, ...row }) => ({
+      ...row, ...(articleId && { articleId }), mode, strict: strict === 'true', mine: rowOwner === owner,
+    }));
+    reply.header('Cache-Control', 'no-store');
+    return { entries: entries.slice(0, 100), self: entries.find((entry) => entry.mine) ?? null, total: rows[0]?.total ?? 0 };
   });
 
   app.get('/api/history', async (request, reply) => {
     const user = userFor(request);
     if (!user) return invalid(reply, '请先登录', 401);
-    const entries = db.prepare(`SELECT id AS recordId,language,difficulty,duration,correct,total,accuracy,speed,status,elapsed_ms AS elapsedMs,backspaces,errors,finished_at AS finishedAt
-      FROM challenges WHERE owner=? AND finished_at IS NOT NULL ORDER BY finished_at DESC LIMIT 100`).all(`u:${user.id}`);
+    if (!accountMatches(request, user)) return invalid(reply, '登录账号已变更', 403);
+    const rows = db.prepare(`SELECT id AS recordId,language,difficulty,duration,correct,total,accuracy,speed,status,elapsed_ms AS elapsedMs,backspaces,errors,
+      finished_at AS finishedAt,article_metadata AS metadata,target,typed,mode,strict
+      FROM challenges WHERE owner=? AND finished_at IS NOT NULL ORDER BY finished_at DESC LIMIT 100`).all(`u:${user.id}`) as Array<{
+        metadata: string | null; target: string; typed: string | null; mode: PracticeMode; strict: number;
+      }>;
+    const entries = rows.map(({ metadata, target, typed, mode, strict, ...summary }) => {
+      if (!metadata || typed === null) return summary;
+      const article = { ...JSON.parse(metadata) as Omit<ArticleSnapshot, 'text'>, text: target };
+      return { ...summary, article, typed, offset: 0, articleTotal: splitCharacters(target).length, mode, strict: !!strict };
+    });
+    reply.header('Cache-Control', 'no-store');
     return { entries };
   });
 
@@ -492,14 +627,17 @@ export async function createApp(options: AppOptions) {
     if (!challenge || !['approve', 'reject'].includes(String(action))) return invalid(reply, '记录或操作无效');
     db.transaction(() => {
       db.prepare('UPDATE challenges SET status=? WHERE id=?').run(action === 'approve' ? 'finished' : 'rejected', id);
-      if (action === 'approve') saveScore(challenge);
+      if (action === 'approve' && challenge.mode === 'timed' && !challenge.strict) saveScore(challenge);
     })();
     return { ok: true };
   });
   app.post('/api/admin/remove/:id', async (request, reply) => {
     if (!asAdmin(request)) return invalid(reply, '没有管理权限', 403);
     const { id } = request.params as { id: string };
-    db.prepare('DELETE FROM scores WHERE attempt_id=?').run(id);
+    db.transaction(() => {
+      db.prepare('UPDATE challenges SET ranking_removed=1 WHERE id=?').run(id);
+      db.prepare('DELETE FROM scores WHERE attempt_id=?').run(id);
+    })();
     return { ok: true };
   });
 

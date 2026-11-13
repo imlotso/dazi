@@ -26,6 +26,20 @@ beforeEach(() => {
 afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
 describe('practice interface', () => {
+  it('keeps a saved article snapshot correctly named after the built-in library changes', async () => {
+    localStorage.setItem('cloudtyping.practice.v1', JSON.stringify({ version: 1, articleId: 'zh-beginner-1', title: '旧的练习文章', text: '旧文章还没有练完。', target: '旧文章还没有练完。', language: 'zh', difficulty: 'beginner', duration: 300, custom: false, offline: true, elapsedMs: 5000, typed: '旧文', backspaces: 0, suspicious: false }));
+    render(<App />);
+    await screen.findByRole('button', { name: '继续练习' }, { timeout: 5000 });
+    expect(screen.getByRole('heading', { name: '旧的练习文章' })).toBeTruthy();
+    expect(screen.queryByRole('link', { name: /查看.*原文/ })).toBeNull();
+    expect(screen.getByTestId('typed-count').textContent).toBe('2');
+    fireEvent.click(screen.getByRole('button', { name: '重新开始' }));
+    const confirm = await screen.findByRole('dialog', { name: '重新开始本次练习？' });
+    fireEvent.click(within(confirm).getByRole('button', { name: '确认重新开始' }));
+    expect(screen.getByRole('heading', { name: '背影' })).toBeTruthy();
+    expect(screen.getByRole('link', { name: '查看《背影》原文' }).getAttribute('href')).toContain('zh.wikisource.org');
+  });
+
   it('switches to night mode and remembers the choice on a later visit', async () => {
     const first = render(<App />);
     fireEvent.click(screen.getByRole('button', { name: '切换至夜间模式' }));
@@ -51,7 +65,7 @@ describe('practice interface', () => {
     }));
     render(<App />);
     await startPractice();
-    const input = screen.getByRole('textbox', { name: /在此输入上方文章/ }) as HTMLTextAreaElement;
+    const input = screen.getByRole('textbox', { name: /当前行输入/ }) as HTMLTextAreaElement;
     await waitFor(() => expect(input.disabled).toBe(false));
     fireEvent.compositionStart(input);
     fireEvent.change(input, { target: { value: '你' } });
@@ -92,7 +106,7 @@ describe('practice interface', () => {
     }));
     render(<App />);
     await startPractice();
-    const input = screen.getByRole('textbox', { name: /在此输入上方文章/ }) as HTMLTextAreaElement;
+    const input = screen.getByRole('textbox', { name: /当前行输入/ }) as HTMLTextAreaElement;
     await waitFor(() => expect(input.disabled).toBe(false));
     fireEvent.change(input, { target: { value: '你' } });
     time = 300_001;
@@ -115,7 +129,7 @@ describe('practice interface', () => {
     }));
     render(<App />);
     await startPractice();
-    const input = screen.getByRole('textbox', { name: /在此输入上方文章/ }) as HTMLTextAreaElement;
+    const input = screen.getByRole('textbox', { name: /当前行输入/ }) as HTMLTextAreaElement;
     await waitFor(() => expect(input.disabled).toBe(false));
     fireEvent.change(input, { target: { value: '你' } });
     time = 300_001;
@@ -127,7 +141,8 @@ describe('practice interface', () => {
 
   it('defaults to five minutes and only accepts a whole number from 1 to 60', async () => {
     render(<App />);
-    await screen.findByRole('button', { name: '开始练习' });
+    const start = await screen.findByRole('button', { name: '开始练习' }) as HTMLButtonElement;
+    await waitFor(() => expect(start.disabled).toBe(false));
     const duration = screen.getByRole('spinbutton', { name: '测试时间（分钟）' }) as HTMLInputElement;
     expect(duration.value).toBe('5');
     fireEvent.change(duration, { target: { value: '0' } });
@@ -153,7 +168,7 @@ describe('practice interface', () => {
     }));
     render(<App />);
     await startPractice();
-    const input = screen.getByRole('textbox', { name: /在此输入上方文章/ }) as HTMLTextAreaElement;
+    const input = screen.getByRole('textbox', { name: /当前行输入/ }) as HTMLTextAreaElement;
     await waitFor(() => expect(input.disabled).toBe(false));
     expect(screen.getByTestId('article-count').textContent).toBe('4');
     fireEvent.compositionStart(input);
@@ -184,7 +199,7 @@ describe('practice interface', () => {
     }));
     const first = render(<App />);
     await startPractice();
-    const input = screen.getByRole('textbox', { name: /在此输入上方文章/ }) as HTMLTextAreaElement;
+    const input = screen.getByRole('textbox', { name: /当前行输入/ }) as HTMLTextAreaElement;
     await waitFor(() => expect(input.disabled).toBe(false));
     time = 5000;
     fireEvent.change(input, { target: { value: '你好' } });
@@ -193,7 +208,7 @@ describe('practice interface', () => {
     first.unmount();
     render(<App />);
     await screen.findByRole('button', { name: '继续练习' });
-    expect((screen.getByRole('textbox', { name: /在此输入上方文章/ }) as HTMLTextAreaElement).value).toBe('你');
+    expect((screen.getByRole('textbox', { name: /当前行输入/ }) as HTMLTextAreaElement).value).toBe('你');
     expect(screen.getByTestId('backspace-count').textContent).toBe('1');
     expect(screen.getByTestId('remaining-time').textContent).toBe('04:55');
   });
@@ -209,7 +224,7 @@ describe('practice interface', () => {
     }));
     render(<App />);
     await startPractice();
-    await waitFor(() => expect((screen.getByRole('textbox', { name: /在此输入上方文章/ }) as HTMLTextAreaElement).disabled).toBe(false));
+    await waitFor(() => expect((screen.getByRole('textbox', { name: /当前行输入/ }) as HTMLTextAreaElement).disabled).toBe(false));
     time = 10_000;
     fireEvent.click(screen.getByRole('button', { name: '暂停练习' }));
     await screen.findByRole('button', { name: '继续练习' });
@@ -232,7 +247,7 @@ describe('practice interface', () => {
     }));
     render(<App />);
     await startPractice();
-    const input = screen.getByRole('textbox', { name: /在此输入上方文章/ }) as HTMLTextAreaElement;
+    const input = screen.getByRole('textbox', { name: /当前行输入/ }) as HTMLTextAreaElement;
     await waitFor(() => expect(input.disabled).toBe(false));
     fireEvent.change(input, { target: { value: '你好' } });
     time = 1000;
@@ -252,7 +267,7 @@ describe('practice interface', () => {
     }));
     render(<App />);
     await startPractice();
-    const input = screen.getByRole('textbox', { name: /在此输入上方文章/ }) as HTMLTextAreaElement;
+    const input = screen.getByRole('textbox', { name: /当前行输入/ }) as HTMLTextAreaElement;
     await waitFor(() => expect(input.disabled).toBe(false));
     fireEvent.compositionStart(input);
     fireEvent.keyDown(input, { key: 'Backspace', isComposing: true });
@@ -284,7 +299,7 @@ describe('practice interface', () => {
     }));
     const first = render(<App />);
     await startPractice();
-    const input = screen.getByRole('textbox', { name: /在此输入上方文章/ }) as HTMLTextAreaElement;
+    const input = screen.getByRole('textbox', { name: /当前行输入/ }) as HTMLTextAreaElement;
     await waitFor(() => expect(input.disabled).toBe(false));
     time = 3000;
     fireEvent.change(input, { target: { value: '你好世界' } });
@@ -324,7 +339,8 @@ describe('practice interface', () => {
     fireEvent.change(secondInput, { target: { value: '乙' } });
     time = 3000;
     fireEvent.change(firstInput, { target: { value: '甲' } });
-    await within(first.container).findByRole('dialog');
+    const finished = await screen.findByRole('dialog', { name: '练习成绩' });
+    expect(within(finished).getByText('1 / 1')).toBeTruthy();
     expect(readDraft()?.typed).toBe('乙');
   });
 
@@ -339,7 +355,7 @@ describe('practice interface', () => {
     }));
     render(<App />);
     await startPractice();
-    await waitFor(() => expect((screen.getByRole('textbox', { name: /在此输入上方文章/ }) as HTMLTextAreaElement).disabled).toBe(false));
+    await waitFor(() => expect((screen.getByRole('textbox', { name: /当前行输入/ }) as HTMLTextAreaElement).disabled).toBe(false));
     time = 5000;
     fireEvent(window, new PageTransitionEvent('pagehide', { persisted: true }));
     time = 25000;
@@ -361,8 +377,8 @@ describe('practice interface', () => {
     expect(await screen.findByText(/45 字\/分/)).toBeTruthy();
   });
 
-  it('keeps unassigned local records visible after the account becomes available', async () => {
-    localStorage.setItem('cloudtyping.history.v1', JSON.stringify([{ language: 'zh', difficulty: 'beginner', duration: 300, speed: 38, accuracy: 97, finishedAt: 1_800_000_000_000, recordId: 'offline', ownerId: null, localOnly: true }]));
+  it('keeps guest records separate from signed-in history', async () => {
+    localStorage.setItem('cloudtyping.history.v1', JSON.stringify([{ language: 'zh', difficulty: 'beginner', duration: 300, speed: 38, accuracy: 97, finishedAt: 1_800_000_000_000, recordId: 'offline', ownerId: null, localOnly: true, article: { id: 'guest-article', title: '访客私文', text: '访客私文', language: 'zh', difficulty: 'beginner', custom: true }, typed: '访客' }]));
     vi.stubGlobal('fetch', vi.fn(async (url: string) => {
       if (url === '/api/me') return response({ user: { id: 'u1', username: 'alice', email: 'alice@example.com', isAdmin: false } });
       if (url === '/api/history') return response({ entries: [] });
@@ -371,8 +387,9 @@ describe('practice interface', () => {
     render(<App />);
     await screen.findByRole('button', { name: /alice/ });
     fireEvent.click(screen.getByRole('button', { name: '我的记录' }));
-    expect(await screen.findByText(/38 字\/分/)).toBeTruthy();
-    expect(screen.getByText('本机未同步')).toBeTruthy();
+    expect(await screen.findByText('暂无记录')).toBeTruthy();
+    expect(screen.queryByText('访客私文')).toBeNull();
+    expect(screen.queryByText(/38 字\/分/)).toBeNull();
   });
 
   it('waits for the current account before starting an offline practice', async () => {
@@ -396,7 +413,7 @@ describe('practice interface', () => {
     }));
     render(<App />);
     await startPractice();
-    const input = screen.getByRole('textbox', { name: /在此输入上方文章/ }) as HTMLTextAreaElement;
+    const input = screen.getByRole('textbox', { name: /当前行输入/ }) as HTMLTextAreaElement;
     await waitFor(() => expect(input.disabled).toBe(false));
     fireEvent.change(input, { target: { value: '你' } });
     fireEvent.compositionStart(input);
@@ -416,7 +433,7 @@ describe('practice interface', () => {
     await screen.findByRole('button', { name: '继续练习' });
     await waitFor(() => expect((screen.getByRole('button', { name: '继续练习' }) as HTMLButtonElement).disabled).toBe(false));
     fireEvent.click(screen.getByRole('button', { name: '继续练习' }));
-    const input = screen.getByRole('textbox', { name: /在此输入上方文章/ }) as HTMLTextAreaElement;
+    const input = screen.getByRole('textbox', { name: /当前行输入/ }) as HTMLTextAreaElement;
     await waitFor(() => expect(input.disabled).toBe(false));
     fireEvent.change(input, { target: { value: '你好世界' } });
     await screen.findByRole('dialog');

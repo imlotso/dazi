@@ -1,0 +1,46 @@
+.background-dialog { width: min(100%, 620px); }
+.background-editor { display: grid; gap: 14px; margin-top: 16px; }
+.background-preview { position: relative; overflow: hidden; isolation: isolate; height: 190px; border: 1px solid var(--typing-border); border-radius: 14px; background: #f8f4fc; }
+.background-preview > img, .custom-background > img { width: 100%; height: 100%; display: block; }
+.background-preview.is-dragging { outline: 3px solid var(--typing-accent); outline-offset: 3px; }
+.background-shade { position: absolute; inset: 0; background: #f8f4fc; pointer-events: none; }
+[data-theme='dark'] .background-shade, .background-preview[data-theme='dark'], .custom-background[data-theme='dark'] { background: #171b30; }
+.background-preview[data-theme='light'] .background-shade { background: #f8f4fc; }
+.background-preview-sample { position: absolute; inset: auto 20%; top: 50%; transform: translateY(-50%); display: grid; gap: 8px; padding: 12px 16px; border: 1px solid var(--typing-border); border-radius: 12px; background: var(--typing-input); color: var(--typing-text); font-size: 13px; }
+.background-preview-sample i { height: 6px; background: var(--typing-active); border-radius: 6px; }
+.background-preview-sample i:last-child { width: 60%; }
+.background-preview[data-theme='light'] .background-preview-sample { background: #fff; color: #45405e; border-color: #d6cdef; }
+.background-preview[data-theme='light'] .background-preview-sample i { background: #edf1fb; }
+.background-file-row, .background-file-row button { display: flex; align-items: center; gap: 8px; }
+.background-file-row { flex-wrap: wrap; justify-content: space-between; }
+.background-file-row button { min-height: 42px; }
+.background-file-info { display: flex; justify-content: space-between; gap: 12px; color: var(--typing-muted); font-size: 12px; }
+.background-file-info > span:first-child { min-width: 0; overflow-wrap: anywhere; }
+.background-file-info > span:last-child { white-space: nowrap; }
+.background-controls { padding: 0; border: 0; margin: 0; min-width: 0; display: grid; gap: 14px; }
+.background-fit { display: flex; justify-content: space-between; align-items: center; gap: 10px; color: var(--typing-text); font-size: 13px; }
+.background-fit select { width: 145px; padding: 8px 10px; border: 1px solid var(--typing-border); border-radius: 10px; color: var(--typing-text); background: var(--typing-input); }
+.background-ranges { display: grid; grid-template-columns: 1fr 1fr; gap: 16px 20px; }
+.background-ranges .settings-range { display: grid; align-items: center; grid-template-columns: 56px minmax(0, 1fr) 36px; gap: 8px; font-size: 12px; color: var(--typing-text); }
+.background-ranges input[type='range'] { min-width: 0; width: 100%; accent-color: var(--typing-accent); }
+.background-editor > p { margin: 0; }
+.background-editor-actions, .background-editor-actions > div { display: flex; align-items: center; gap: 10px; }
+.background-editor-actions { justify-content: space-between; padding-top: 4px; }
+.background-editor-actions .text-button { display: inline-flex; align-items: center; gap: 5px; min-height: 42px; }
+.background-editor-actions .primary-button, .background-editor-actions .outline-button { padding: 10px 20px; min-height: 42px; }
+.room.room-custom { background-image: none; }
+.custom-background { position: absolute; z-index: 0; inset: 0; overflow: hidden; pointer-events: none; background: #f8f4fc; }
+.room-custom .workspace::before { content: ''; position: absolute; z-index: -1; inset: 20px -18px 125px; border-radius: 24px; background: rgba(253,251,253,.92); }
+[data-theme='dark'] .room-custom .workspace::before { background: rgba(26,29,48,.95); }
+@media (max-width: 600px) {
+  .background-dialog { padding: 20px 18px; }
+  .background-preview { height: 160px; }
+  .background-ranges { grid-template-columns: 1fr; gap: 12px; }
+  .background-ranges .settings-range { grid-template-columns: 60px minmax(0, 1fr) 40px; }
+  .background-file-row { gap: 8px 12px; }
+  .background-file-row .feature-muted { font-size: 11px; }
+  .background-editor-actions { gap: 8px; }
+  .background-editor-actions > div { gap: 6px; }
+  .background-editor-actions .primary-button, .background-editor-actions .outline-button { padding-inline: 14px; }
+  .room-custom .workspace::before { inset: 20px -6px 125px; border-radius: 16px; }
+}

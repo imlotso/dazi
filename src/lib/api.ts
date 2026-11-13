@@ -1,4 +1,11 @@
-export async function api<T>(path: string, options?: { method?: 'GET' | 'POST'; body?: unknown; signal?: AbortSignal; timeoutMs?: number }): Promise<T> {
+export class ApiError extends Error {
+  constructor(message: string, public readonly status: number) {
+    super(message);
+    this.name = 'ApiError';
+  }
+}
+
+export async function api<T>(path: string, options?: { method?: 'GET' | 'POST'; body?: unknown; signal?: AbortSignal; timeoutMs?: number; headers?: HeadersInit }): Promise<T> {
   const controller = new AbortController();
   const cancel = () => controller.abort();
   const timeout = setTimeout(cancel, options?.timeoutMs ?? 12_000);
@@ -7,11 +14,13 @@ export async function api<T>(path: string, options?: { method?: 'GET' | 'POST'; 
   try {
     let response: Response;
     try {
+      const headers = new Headers(options?.headers);
+      if (options?.body !== undefined) headers.set('Content-Type', 'application/json');
       response = await fetch(path, {
         method: options?.method ?? 'GET',
         credentials: 'same-origin',
         signal: controller.signal,
-        headers: options?.body === undefined ? undefined : { 'Content-Type': 'application/json' },
+        headers: options?.body === undefined && !options?.headers ? undefined : headers,
         body: options?.body === undefined ? undefined : JSON.stringify(options.body),
       });
     } catch (error) {
@@ -26,7 +35,7 @@ export async function api<T>(path: string, options?: { method?: 'GET' | 'POST'; 
       throw new Error(response.ok ? '服务返回的数据无法读取' : '操作未完成，请稍后重试');
     }
     if (!data || typeof data !== 'object' || Array.isArray(data)) throw new Error('服务返回的数据无法读取');
-    if (!response.ok) throw new Error((data as { error?: string }).error || '操作未完成，请稍后重试');
+    if (!response.ok) throw new ApiError((data as { error?: string }).error || '操作未完成，请稍后重试', response.status);
     return data as T;
   } finally {
     clearTimeout(timeout);
