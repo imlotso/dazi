@@ -1,4 +1,5 @@
 import type Database from 'better-sqlite3';
+import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import { difficulties } from '../src/data/articles';
 import type { WorkspaceItem, WorkspaceKind } from '../src/lib/models';
@@ -9,6 +10,7 @@ export const recoveryIdPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0
 export const recoveryKeyPattern = /^[A-Za-z0-9_-]{43}$/;
 const maxWorkspaceItems = 2000;
 const maxWorkspaceBytes = 32 * 1024 * 1024;
+const maxPageBytes = 2 * 1024 * 1024;
 const maxElapsedMs = 24 * 60 * 60_000;
 const clockGraceMs = 5 * 60_000;
 const id = z.string().min(1).max(200).regex(/^[^\p{Cc}\p{Cf}]+$/u);
@@ -117,9 +119,21 @@ export function createWorkspaceStore(db: Database.Database) {
       kind TEXT NOT NULL, item_id TEXT NOT NULL, updated_at INTEGER NOT NULL,
       value TEXT, PRIMARY KEY(user_id, kind, item_id)
     );
+    CREATE TABLE IF NOT EXISTS workspace_revisions (
+      user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+      revision INTEGER NOT NULL DEFAULT 0
+    );
   `);
   const read = db.prepare(`SELECT kind, item_id AS id, updated_at AS updatedAt, value
     FROM workspace_items WHERE user_id=? ORDER BY kind, item_id`);
+  const readBackgrounds = db.prepare(`SELECT kind, item_id AS id, updated_at AS updatedAt, value
+    FROM workspace_items WHERE user_id=? AND kind='background' ORDER BY kind, item_id`);
+  const readPage = db.prepare(`SELECT kind, item_id AS id, updated_at AS updatedAt, value
+    FROM workspace_items WHERE user_id=? AND (?=0 OR kind!='background')
+      AND (kind>? OR (kind=? AND item_id>?)) ORDER BY kind,item_id LIMIT 101`);
+  const readRevision = db.prepare('SELECT revision FROM workspace_revisions WHERE user_id=?');
+  const bumpRevision = db.prepare(`INSERT INTO workspace_revisions(user_id,revision) VALUES (?,1)
+    ON CONFLICT(user_id) DO UPDATE SET revision=workspace_revisions.revision+1`);
   const limits = db.prepare('SELECT COUNT(*) AS count, COALESCE(SUM(length(CAST(value AS BLOB))), 0) AS bytes FROM workspace_items WHERE user_id=?');
   const storedClaim = "COALESCE(json_extract(workspace_items.value, '$.claimVersion'), 0)";
   const incomingClaim = "COALESCE(json_extract(excluded.value, '$.claimVersion'), 0)";
@@ -148,19 +162,68 @@ export function createWorkspaceStore(db: Database.Database) {
       ELSE excluded.updated_at > workspace_items.updated_at
     END`);
   const merge = db.transaction((owner: string, items: WorkspaceItem[]) => {
+    let changed = false;
     for (const { kind, id, updatedAt, deleted, value } of items) {
-      upsert.run(owner, kind, id, updatedAt, deleted ? null : JSON.stringify(value));
+      if (upsert.run(owner, kind, id, updatedAt, deleted ? null : JSON.stringify(value)).changes) changed = true;
     }
     const { count, bytes } = limits.get(owner) as { count: number; bytes: number };
     if (count > maxWorkspaceItems || bytes > maxWorkspaceBytes) throw new WorkspaceLimitError();
+    if (changed) bumpRevision.run(owner);
   });
-  const get = (owner: string): WorkspaceItem[] =>
-    (read.all(owner) as Array<Omit<WorkspaceItem, 'value'> & { value: string | null }>).map(({ value, ...item }) => {
+  const decode = (rows: unknown[]): WorkspaceItem[] =>
+    (rows as Array<Omit<WorkspaceItem, 'value'> & { value: string | null }>).map(({ value, ...item }) => {
       if (value === null) return { ...item, deleted: true };
       const data: unknown = JSON.parse(value);
       return { ...item, value: item.kind === 'draft' ? stripDraftLease(data) : data };
     });
-  return { get, merge };
+  const get = (owner: string) => decode(read.all(owner));
+  function page(owner: string, cursor: string | undefined, skipBackgrounds: boolean) {
+    const revision = (readRevision.get(owner) as { revision: number } | undefined)?.revision ?? 0;
+    let kind = '';
+    let id = '';
+    if (cursor !== undefined) {
+      try {
+        if (cursor.length > 2048 || !/^[A-Za-z0-9_-]+$/.test(cursor)) throw new Error();
+        const decoded: unknown = JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8'));
+        if (!Array.isArray(decoded) || decoded.length !== 3 || !Number.isSafeInteger(decoded[0]) ||
+          typeof decoded[1] !== 'string' || !['article', 'background', 'draft', 'favorite', 'record', 'settings'].includes(decoded[1]) ||
+          typeof decoded[2] !== 'string' || !decoded[2] || decoded[2].length > 200) throw new Error();
+        if (decoded[0] !== revision) throw new WorkspaceChangedError();
+        [, kind, id] = decoded;
+      } catch (error) {
+        if (error instanceof WorkspaceChangedError) throw error;
+        throw new WorkspaceCursorError();
+      }
+    }
+    const candidates = decode(readPage.all(owner, Number(skipBackgrounds), kind, kind, id));
+    const items: WorkspaceItem[] = [];
+    let bytes = 4096;
+    for (const candidate of candidates) {
+      const size = Buffer.byteLength(JSON.stringify(candidate)) + 1;
+      if (bytes + size > maxPageBytes || items.length >= 100) {
+        if (!items.length) throw new WorkspacePageSizeError();
+        break;
+      }
+      bytes += size;
+      items.push(candidate);
+    }
+    const last = items.at(-1);
+    const nextCursor = last && items.length < candidates.length
+      ? Buffer.from(JSON.stringify([revision, last.kind, last.id])).toString('base64url') : null;
+    return { items, nextCursor };
+  }
+  // Read the background token, revision and rows from one SQLite snapshot even
+  // when another local process writes to the same database concurrently.
+  const pagedSnapshot = db.transaction((owner: string, cursor: string | undefined, known: string | undefined) => {
+    const backgrounds = decode(readBackgrounds.all(owner));
+    const backgroundsVersion = createHash('sha256').update(owner).update(JSON.stringify(backgrounds)).digest('hex');
+    const backgroundsUnchanged = known === backgroundsVersion;
+    return { ...page(owner, cursor, backgroundsUnchanged), backgroundsVersion, backgroundsUnchanged };
+  });
+  return { get, pagedSnapshot, merge };
 }
 
 export class WorkspaceLimitError extends Error {}
+export class WorkspaceChangedError extends Error {}
+export class WorkspaceCursorError extends Error {}
+export class WorkspacePageSizeError extends Error {}

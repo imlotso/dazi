@@ -9,7 +9,7 @@ import { existsSync } from 'node:fs';
 import { difficulties, type Difficulty, type Language } from '../src/data/articles';
 import { scoreTyping, splitCharacters } from '../src/lib/scoring';
 import { catalogSnapshotKey, type ArticleSnapshot, type PracticeMode, type RankingEntry } from '../src/lib/models';
-import { createWorkspaceStore, recoveryIdPattern, recoveryKeyPattern, syncBodyLimit, validateWorkspaceItems, WorkspaceLimitError } from './workspace';
+import { createWorkspaceStore, recoveryIdPattern, recoveryKeyPattern, syncBodyLimit, validateWorkspaceItems, WorkspaceChangedError, WorkspaceCursorError, WorkspaceLimitError, WorkspacePageSizeError } from './workspace';
 import { AdminAccessError, createAdminAudit, migrateAdministration, registerAdminRoutes } from './admin';
 import { createCatalogStore, registerCatalogRoutes } from './catalog';
 import { createSiteSettings, registerSiteSettingsRoutes } from './site-settings';
@@ -415,11 +415,27 @@ export async function createApp(options: AppOptions) {
     };
   }
 
+  const pagedWorkspace = (request: FastifyRequest) =>
+    (request.query as { paged?: string }).paged === '1' || request.headers['x-workspace-paged'] === '1';
+
   app.get('/api/workspace', async (request, reply) => {
     const user = userFor(request);
     if (!user) return invalid(reply, '请先登录', 401);
     if (!accountMatches(request, user)) return invalid(reply, '登录账号已变更', 403);
     reply.header('Cache-Control', 'no-store');
+    if (pagedWorkspace(request)) {
+      const rawCursor = (request.query as { cursor?: unknown }).cursor ?? request.headers['x-workspace-cursor'];
+      if (rawCursor !== undefined && typeof rawCursor !== 'string') return invalid(reply, '同步游标无效');
+      const known = request.headers['x-workspace-backgrounds'];
+      try {
+        return { ...workspace.pagedSnapshot(user.id, rawCursor, typeof known === 'string' ? known : undefined), serverTime: now() };
+      } catch (error) {
+        if (error instanceof WorkspaceCursorError) return invalid(reply, '同步游标无效');
+        if (error instanceof WorkspaceChangedError) return reply.code(409).send({ error: '同步数据已变更，请重试', code: 'WORKSPACE_CHANGED' });
+        if (error instanceof WorkspacePageSizeError) return invalid(reply, '同步项目过大，请联系管理员', 413);
+        throw error;
+      }
+    }
     return workspaceResponse(request, user.id, now());
   });
 
@@ -436,6 +452,7 @@ export async function createApp(options: AppOptions) {
       throw error;
     }
     reply.header('Cache-Control', 'no-store');
+    if (pagedWorkspace(request)) return { acknowledged: true, serverTime };
     return workspaceResponse(request, user.id, serverTime);
   });
 
