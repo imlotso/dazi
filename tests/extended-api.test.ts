@@ -52,6 +52,32 @@ describe('extended practice API', () => {
     return app.inject({ method: 'GET', url: '/api/workspace', headers });
   }
 
+  it('does not let an outdated account view log out a newly signed-in account', async () => {
+    const first = await register('first'); const second = await register('second');
+    const me = (headers: { cookie: string }) => app.inject({ method: 'GET', url: '/api/me', headers });
+    const firstId = (await me(first)).json().user.id;
+    const secondId = (await me(second)).json().user.id;
+    const rejected = await app.inject({ method: 'POST', url: '/api/auth/logout', headers: { ...second, 'x-workspace-owner': firstId }, payload: {} });
+    expect(rejected.statusCode).toBe(403);
+    expect(rejected.cookies).toEqual([]);
+    expect((await me(second)).json().user.id).toBe(secondId);
+    expect((await app.inject({ method: 'POST', url: '/api/auth/logout', headers: { ...second, 'x-workspace-owner': secondId }, payload: {} })).statusCode).toBe(200);
+    expect((await me(second)).json().user).toBeNull();
+  });
+
+  it('does not overwrite a newer login cookie when an older scoped logout response arrives late', async () => {
+    const first = await register('first');
+    const firstId = (await app.inject({ method: 'GET', url: '/api/me', headers: first })).json().user.id;
+    const delayedLogout = await app.inject({ method: 'POST', url: '/api/auth/logout', headers: { ...first, 'x-workspace-owner': firstId }, payload: {} });
+    expect(delayedLogout.statusCode).toBe(200);
+    const second = await register('second');
+    let sharedCookie = second.cookie;
+    for (const cookie of delayedLogout.cookies) if (cookie.name === 'session') sharedCookie = cookie.name + '=' + cookie.value;
+    const current = (await app.inject({ method: 'GET', url: '/api/me', headers: { cookie: sharedCookie } })).json().user;
+    expect(current?.username).toBe('second');
+    expect((await app.inject({ method: 'GET', url: '/api/me', headers: first })).json().user).toBeNull();
+  });
+
   it('retains the newer tombstone through restart and isolates the workspace by account', async () => {
     expect((await workspace()).statusCode).toBe(401);
     expect((await sync([])).statusCode).toBe(401);

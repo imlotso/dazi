@@ -15,7 +15,7 @@ import { SignOut } from '@phosphor-icons/react/SignOut';
 import { Sun } from '@phosphor-icons/react/Sun';
 import { Trophy } from '@phosphor-icons/react/Trophy';
 import { UserCircle } from '@phosphor-icons/react/UserCircle';
-import { AdminConsole } from './components/AdminConsole';
+import { AdminWorkspace } from './components/AdminWorkspace';
 import { ArticleLibrary } from './components/ArticleLibrary';
 import { BackgroundDialog } from './components/BackgroundDialog';
 import { RoomBackground } from './components/RoomBackground';
@@ -38,7 +38,7 @@ import { scoreTyping, splitCharacters } from './lib/scoring';
 import { resolveTheme, themeStorageKey, type Theme } from './lib/theme';
 import { deleteWorkspaceValue, DraftDeletedError, isWorkspaceDraftDeleted, putWorkspaceValue } from './lib/workspace';
 
-type View = 'practice' | 'library' | 'rankings' | 'history' | 'drafts' | 'mistakes' | 'stats' | 'admin';
+type View = 'practice' | 'library' | 'rankings' | 'history' | 'drafts' | 'mistakes' | 'stats';
 type PendingLoad = { legacy: PracticeDraft } | { draft: SavedPractice; newRound?: boolean };
 const difficultyNames: Record<Difficulty, string> = { beginner: '入门', intermediate: '进阶', advanced: '挑战' };
 const languageNames: Record<Language, string> = { zh: '中文', en: 'English' };
@@ -85,9 +85,12 @@ function mergeRecords(local: PracticeRecord[], remote: PracticeRecord[], workspa
 export function App() {
   const [user, setUser] = useState<User | null>(null);
   const [authReady, setAuthReady] = useState(false);
+  const [previewOwner, setPreviewOwner] = useState<string>();
   const request = useRef<AbortController | null>(null);
   const changeUser = useCallback((next: User | null) => {
     request.current?.abort();
+    setPreviewOwner(undefined);
+    window.history.replaceState(null, '', next?.isAdmin ? '/admin' : '/');
     setUser(next);
     setAuthReady(true);
   }, []);
@@ -111,10 +114,23 @@ export function App() {
     };
   }, []);
 
-  return <PracticeApp key={user ? `account:${user.id}` : 'guest'} user={user} authReady={authReady} onUser={changeUser} />;
+  const inAdministration = !!user?.isAdmin && previewOwner !== user.id;
+  useEffect(() => {
+    if (!authReady || !user) return;
+    const target = inAdministration ? '/admin' : '/';
+    if (window.location.pathname !== target) window.history.replaceState(null, '', target);
+  }, [authReady, user?.id, user?.isAdmin, inAdministration]);
+  useEffect(() => {
+    if (!user?.isAdmin || previewOwner !== user.id) setPreviewOwner(undefined);
+  }, [user?.id, user?.isAdmin, previewOwner]);
+
+  if (!authReady && /^\/admin\/?$/.test(window.location.pathname)) return <div className="administration-session" role="status"><Cloud size={32} aria-hidden="true" />正在读取账号…</div>;
+  if (inAdministration && user) return <AdminWorkspace key={user.id} user={user} onLogout={() => changeUser(null)} onPreview={() => setPreviewOwner(user.id)} />;
+  return <PracticeApp key={user ? `account:${user.id}` : 'guest'} user={user} authReady={authReady} onUser={changeUser}
+    onAdministration={user?.isAdmin ? () => setPreviewOwner(undefined) : undefined} />;
 }
 
-function PracticeApp({ user, authReady, onUser }: { user: User | null; authReady: boolean; onUser: (user: User | null) => void }) {
+function PracticeApp({ user, authReady, onUser, onAdministration }: { user: User | null; authReady: boolean; onUser: (user: User | null) => void; onAdministration?: () => void }) {
   const ownerId = user?.id ?? null;
   const workspace = useWorkspace(ownerId, authReady);
   const [selection, setSelection] = useState(builtIns[0]);
@@ -123,7 +139,7 @@ function PracticeApp({ user, authReady, onUser }: { user: User | null; authReady
   const refreshCatalog = useCallback(() => setCatalogRevision((revision) => revision + 1), []);
   const [guestTheme, setGuestTheme] = useState(initialTheme);
   const [directAdmin] = useState(() => /^\/admin\/?$/.test(window.location.pathname));
-  const [view, setView] = useState<View>(() => directAdmin && user?.isAdmin ? 'admin' : 'practice');
+  const [view, setView] = useState<View>('practice');
   const [adminLoginDismissed, setAdminLoginDismissed] = useState(false);
   const [minutesText, setMinutesText] = useState<string>();
   const [pendingTheme, setPendingTheme] = useState<Theme>();
@@ -512,11 +528,12 @@ function PracticeApp({ user, authReady, onUser }: { user: User | null; authReady
 
   async function changeAccount() {
     if (!canChangeAccount) return;
+    if (onAdministration) { await afterPark(onAdministration); return; }
     setAccountBusy(true);
     try {
       await afterPark(async () => {
         if (!user) { setShowAuth(true); return; }
-        await api('/api/auth/logout', { method: 'POST', body: {} });
+        await api('/api/auth/logout', { method: 'POST', body: {}, headers: { 'X-Workspace-Owner': user.id } });
         if (live.current) onUser(null);
       });
     } catch (problem) {
@@ -536,7 +553,7 @@ function PracticeApp({ user, authReady, onUser }: { user: User | null; authReady
         {(['zh', 'en'] as const).map((item) => <button key={item} disabled={locked} aria-pressed={language === item} onClick={() => changeLanguage(item)}>{languageNames[item]}</button>)}
       </div>
       <span className="filter-divider" aria-hidden="true" />
-      {currentMode === 'timed' ? <label className="duration-input"><Clock size={21} /><span>测试时间</span><input type="number" min="1" max="60" step="1" aria-label="测试时间（分钟）" aria-invalid={!locked && !validDuration} value={phase === 'ready' ? configuredMinutes : String(currentDuration / 60)} disabled={locked} onChange={changeDuration} /><span>分钟</span></label> : <span className="count-chip">整篇</span>}
+      {currentMode === 'timed' ? <label className="duration-input"><Clock size={21} /><span>测试时间</span><input type="number" min="1" max="60" step="1" aria-label="测试时间（分钟）" aria-invalid={!locked && !validDuration} value={phase === 'ready' ? configuredMinutes : String(currentDuration / 60)} disabled={locked || (!!user && !workspace.settingsReady)} onChange={changeDuration} /><span>分钟</span></label> : <span className="count-chip">整篇</span>}
       {currentStrict && <span className="count-chip">严格纠错</span>}
     </div>
     <div className="detail-filters">
@@ -557,12 +574,11 @@ function PracticeApp({ user, authReady, onUser }: { user: User | null; authReady
           <button ref={moreButton} className={view === 'drafts' || view === 'mistakes' || view === 'stats' ? 'nav-active' : ''} aria-expanded={showMore} aria-controls={showMore ? 'practice-more' : undefined} onClick={() => setShowMore((value) => !value)}>更多 <CaretDown size={12} aria-hidden="true" /></button>
           {showMore && <div className="more-popover" id="practice-more">
             {(Object.keys(secondaryNames) as Array<keyof typeof secondaryNames>).map((item) => <button key={item} aria-current={view === item ? 'page' : undefined} onClick={() => { moreButton.current?.focus(); navigate(item); }}>{secondaryNames[item]}</button>)}
-            <button onClick={() => { moreButton.current?.focus(); openSettings(); }}>设置</button>
+            <button disabled={!!user && !workspace.settingsReady} onClick={() => { moreButton.current?.focus(); openSettings(); }}>设置</button>
           </div>}
         </div>
-        {user?.isAdmin && <button className={view === 'admin' ? 'nav-active' : ''} onClick={() => navigate('admin')}>管理后台</button>}
-        <button className="theme-button" aria-label={theme === 'dark' ? '切换至日间模式' : '切换至夜间模式'} aria-pressed={theme === 'dark'} onClick={toggleTheme}>{theme === 'dark' ? <Sun size={20} /> : <MoonStars size={20} />}<span>{theme === 'dark' ? '日间' : '夜间'}</span></button>
-        {user ? <button className="account-button" disabled={!canChangeAccount} onClick={() => void changeAccount()} title="退出登录"><UserCircle size={21} /> {user.username} <SignOut size={16} /></button> : <button className="account-button" disabled={!canChangeAccount} onClick={() => void changeAccount()}>登录</button>}
+        <button className="theme-button" disabled={!!user && !workspace.settingsReady} aria-label={theme === 'dark' ? '切换至日间模式' : '切换至夜间模式'} aria-pressed={theme === 'dark'} onClick={toggleTheme}>{theme === 'dark' ? <Sun size={20} /> : <MoonStars size={20} />}<span>{theme === 'dark' ? '日间' : '夜间'}</span></button>
+        {user ? <button className="account-button" disabled={!canChangeAccount} onClick={() => void changeAccount()} title={onAdministration ? '返回管理界面' : '退出登录'} aria-label={onAdministration ? `${user.username}，返回管理界面` : undefined}><UserCircle size={21} /> {onAdministration ? '返回管理' : user.username} {onAdministration ? <ArrowRight size={16} /> : <SignOut size={16} />}</button> : <button className="account-button" disabled={!canChangeAccount} onClick={() => void changeAccount()}>登录</button>}
       </nav>
     </header>}
     <RoomBackground theme={theme} background={workspace.backgrounds[theme]}>
@@ -596,11 +612,10 @@ function PracticeApp({ user, authReady, onUser }: { user: User | null; authReady
           </section>
           {practiceNotice && <p className="practice-notice" role="status">{practiceNotice}</p>}
         </>}
-        {directAdmin && user && !user.isAdmin && <p className="form-error view-error" role="alert">没有管理权限</p>}
         {view !== 'practice' && feedback && <p className="form-error view-error" role="alert">{feedback}</p>}
         {historyError && recordViews.includes(view) && <p className="form-error view-error" role="status">连接失败，显示本机记录。</p>}
         {view === 'library' && <ArticleLibrary articles={catalog} favorites={workspace.favorites} onToggleFavorite={(id) => void workspace.toggleFavorite(id).catch(reportSaveError)} onSelect={selectArticle} onSave={(article) => workspace.put('article', article.id, article)} onDelete={(id) => workspace.remove('article', id)} />}
-        {view === 'rankings' && <RankingView initial={{ language, difficulty, duration, mode: currentMode, strict: currentStrict }} articles={publicArticles} isAdmin={!!user?.isAdmin} ownerId={ownerId} />}
+        {view === 'rankings' && <RankingView initial={{ language, difficulty, duration, mode: currentMode, strict: currentStrict }} articles={publicArticles} isAdmin={false} ownerId={ownerId} />}
         {view === 'history' && <RecordsView records={records} onReplay={selectArticle} onContinue={continueRecord} />}
         {view === 'drafts' && <DraftsView drafts={draftBox.drafts} onResume={(draft) => continueDraft(draft)} onDelete={deleteDraft}
           recovery={draftBox.completed.map((draft) => ({
@@ -616,7 +631,6 @@ function PracticeApp({ user, authReady, onUser }: { user: User | null; authReady
         />}
         {view === 'mistakes' && <MistakesView records={records} onPractice={selectArticle} />}
         {view === 'stats' && <StatsView records={records} />}
-        {view === 'admin' && user?.isAdmin && <AdminConsole ownerId={user.id} onCatalogChange={refreshCatalog} />}
       </div>
     </RoomBackground>
     {showCustom && <Dialog title="自定义练习文字" onClose={() => setShowCustom(false)}>
@@ -624,7 +638,7 @@ function PracticeApp({ user, authReady, onUser }: { user: User | null; authReady
       {customError && <p className="form-error" role="alert">{customError}</p>}
       <div className="result-actions"><span className="custom-count">{splitCharacters(customDraft).length} / 20000 字符</span><button className="primary-button" onClick={useCustomText}>使用这段文字</button></div>
     </Dialog>}
-    {(showAuth || adminLogin) && <AuthDialog onClose={() => { setShowAuth(false); setAdminLoginDismissed(true); }} onLogin={onUser} />}
+    {(showAuth || adminLogin) && <AuthDialog onClose={() => { setShowAuth(false); setAdminLoginDismissed(true); if (directAdmin) window.history.replaceState(null, '', '/'); }} onLogin={onUser} />}
     {showSettings && <SettingsDialog settings={{ ...workspace.settings, minutes: locked ? currentDuration / 60 : duration / 60, mode: locked ? currentMode : workspace.settings.mode, strict: locked ? currentStrict : workspace.settings.strict }} onChange={updateSettings} locked={locked} onClose={() => setShowSettings(false)} onFocus={enterFocus} focused={focused} syncState={workspace.syncState} onSync={() => void workspace.sync()} isSignedIn={!!user} hasBackground={!!workspace.backgrounds[theme]} onBackground={() => { setShowSettings(false); setShowBackground(theme); }} />}
     {showBackground && <BackgroundDialog theme={showBackground} value={workspace.backgrounds[showBackground]} onClose={() => setShowBackground(undefined)} onSave={(background) => background ? workspace.put('background', showBackground, background) : workspace.remove('background', showBackground)} />}
     {confirmPractice && <Dialog title={confirmPractice.action === 'restart' ? '重新开始本次练习？' : '结束本次练习？'} onClose={cancelPracticeAction}>
