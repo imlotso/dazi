@@ -184,8 +184,11 @@ export function useWorkspace(ownerId: string | null, enabled = true) {
     putWorkspaceValue(ownerId, kind, id, value), [ownerId]);
   const remove = useCallback((kind: WorkspaceKind, id: string) =>
     deleteWorkspaceValue(ownerId, kind, id), [ownerId]);
-  const updateSettings = useCallback((patch: Partial<ReaderSettings>) =>
-    mutateWorkspaceValue(ownerId, 'settings', 'preferences', (_saved, items) => ({ ...workspaceSettings(items), ...patch })), [ownerId]);
+  const settingsAvailable = !ownerId || (view.ownerId === ownerId && (view.cloudLoaded || workspaceValue(view.items, 'settings', 'preferences') !== undefined));
+  const updateSettings = useCallback((patch: Partial<ReaderSettings>) => {
+    if (!settingsAvailable) return Promise.reject(new Error('账号设置尚未读取'));
+    return mutateWorkspaceValue(ownerId, 'settings', 'preferences', (_saved, items) => ({ ...workspaceSettings(items), ...patch }));
+  }, [ownerId, settingsAvailable]);
   const toggleFavorite = useCallback((id: string) =>
     mutateWorkspaceValue(ownerId, 'favorite', id, (old) => old ? undefined : { articleId: id }), [ownerId]);
   const sync = useCallback(() =>
@@ -198,6 +201,7 @@ export function useWorkspace(ownerId: string | null, enabled = true) {
     const get = <K extends WorkspaceKind>(kind: K) => active.filter((item) => item.kind === kind).map((item) => item.value as WorkspaceValues[K]);
     return {
       settings: workspaceSettings(items),
+      hasSavedSettings: workspaceValue(items, 'settings', 'preferences') !== undefined,
       backgrounds: { light: workspaceValue(items, 'background', 'light'), dark: workspaceValue(items, 'background', 'dark') },
       favorites: get('favorite').map((favorite) => favorite.articleId),
       privateArticles: get('article'),
@@ -210,6 +214,7 @@ export function useWorkspace(ownerId: string | null, enabled = true) {
   return {
     ...values,
     ready: visible?.ready ?? false,
+    settingsReady: !!visible?.ready && (!ownerId || visible.cloudLoaded || values.hasSavedSettings),
     cloudLoaded: visible?.cloudLoaded ?? false,
     syncState: visible?.syncState ?? (ownerId ? 'loading' : 'guest'),
     error: visible?.error ?? '',

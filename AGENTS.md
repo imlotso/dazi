@@ -16,6 +16,8 @@ Custom backgrounds (2026-11-14): provide a complete user workflow, including ima
 
 Admin console (2026-11-14): implement actual dashboard, user and administrator role management, public article management, score moderation, and audit logs. Keep account access changes transactional and revoke affected sessions. Preserve historical article snapshots and keep private practice content and background images out of admin endpoints.
 
+Admin entry correction (2026-11-14): use the existing shared login entry and route by the authenticated account's role. Administrator login and session restoration open a separate management interface; normal accounts remain in the practice interface. Do not place a standalone “管理后台” navigation item in the public/practice header or embed management panels in the cloud-room practice layout. Keep the blue/lavender identity in the independent management shell. An explicit front-site preview is allowed; return to management through the account entry.
+
 Practice must default to five minutes, accept whole-minute durations from 1 through 60, and finish immediately when the selected article is fully entered. Preserve unfinished progress locally, support pause and resume, handle Chinese IME composition correctly, calculate speed from active time, and display article length, entered characters, errors, and backspace count.
 
 Run the local server yourself and open the preview in the browser available to this environment. Do not give the user server-start instructions when you can run it.

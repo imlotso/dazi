@@ -161,6 +161,8 @@ test('submits an online result, registers an admin with a test email and publish
   await registration.getByRole('textbox', { name: '邮箱验证码', exact: true }).fill((await email.json()).code);
   await registration.getByRole('button', { name: '注册并登录' }).click();
   await expect(page.getByTitle('退出登录')).toContainText('ci_admin');
+  await expect(page.getByRole('heading', { name: '管理后台' })).toBeVisible();
+  await expect(page.getByRole('navigation', { name: '主要导航' })).toHaveCount(0);
   const loggedOut = page.waitForResponse((response) => response.url().endsWith('/api/auth/logout') && response.request().method() === 'POST');
   await page.getByTitle('退出登录').click();
   expect((await loggedOut).status()).toBe(200);
@@ -174,8 +176,9 @@ test('submits an online result, registers an admin with a test email and publish
   expect((await loggedIn).status()).toBe(200);
   await page.reload();
   await expect(page.getByTitle('退出登录')).toContainText('ci_admin');
-
-  await page.getByRole('button', { name: '管理后台', exact: true }).click();
+  await expect(page).toHaveURL(/\/admin$/);
+  await expect(page.locator('.room')).toHaveCount(0);
+  await expect(page.getByRole('heading', { name: '管理后台' })).toBeVisible();
   await page.getByRole('button', { name: '成绩', exact: true }).click();
   const row = page.locator('li').filter({ hasText: 'CI 访客' });
   await expect(row).toBeVisible();
@@ -185,10 +188,15 @@ test('submits an online result, registers an admin with a test email and publish
   await approval.getByRole('textbox', { name: '原因' }).fill('核对练习记录');
   await approval.getByRole('button', { name: '确认通过' }).click();
   await expect(row).toHaveCount(0);
+  await page.getByRole('button', { name: '预览网站', exact: true }).click();
+  await expect(page.getByRole('button', { name: '管理后台', exact: true })).toHaveCount(0);
   await page.getByRole('button', { name: '排行榜', exact: true }).click();
   const ranked = page.locator('li').filter({ hasText: 'CI 访客' });
   await expect(ranked.locator('strong')).toHaveText(`${expectedSpeed} 字/分`);
   await expect(ranked).toContainText('100%');
+  await page.getByTitle('返回管理界面').click();
+  await expect(page.getByRole('heading', { name: '管理后台' })).toBeVisible();
+  await expect(page.getByRole('navigation', { name: '主要导航' })).toHaveCount(0);
 });
 
 const password = 'ci-password-123';
@@ -203,7 +211,15 @@ test('manages a live account and publishes a sourced article into the practice c
   const readerContext = await browser.newContext({ baseURL: test.info().project.use.baseURL });
   const reader = await readerContext.newPage();
   await register(reader.request, 'admin_e2e_reader');
+  await reader.request.post('/api/auth/logout', { data: {} });
   await reader.goto('/');
+  await reader.getByRole('button', { name: '登录', exact: true }).click();
+  const memberLogin = reader.getByRole('dialog', { name: '登录' });
+  await memberLogin.getByLabel('用户名或邮箱').fill('admin_e2e_reader');
+  await memberLogin.getByLabel('密码', { exact: true }).fill(password);
+  await memberLogin.getByRole('button', { name: '登录', exact: true }).click();
+  await expect(reader.getByTitle('退出登录')).toContainText('admin_e2e_reader');
+  await expect(reader.getByRole('button', { name: '开始练习', exact: true })).toBeVisible();
   await expect(reader.getByRole('button', { name: '管理后台', exact: true })).toHaveCount(0);
   expect((await reader.request.get('/api/admin/overview')).status()).toBe(403);
   const owner = await page.request.post('/api/auth/login', { data: { identifier: 'admin@example.test', password } });
@@ -276,6 +292,7 @@ test('manages a live account and publishes a sourced article into the practice c
 
   await page.getByRole('button', { name: '切换至夜间模式' }).click();
   await page.setViewportSize({ width: 390, height: 844 });
+  await expect(page.getByRole('button', { name: '预览网站', exact: true })).toBeInViewport();
   await page.getByRole('button', { name: '操作日志', exact: true }).click();
   await expect(page.getByRole('heading', { name: '发布文章 · 浏览器验证文章' })).toBeVisible();
   await expect(page.getByText('账户操作验证完成', { exact: true })).toBeVisible();

@@ -342,8 +342,12 @@ export async function createApp(options: AppOptions) {
   });
 
   app.post('/api/auth/logout', async (request, reply) => {
+    const current = userFor(request);
+    if (current && !accountMatches(request, current)) return invalid(reply, '登录账号已变更', 403);
     if (request.cookies.session) db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(digest(request.cookies.session));
-    reply.clearCookie('session', cookieOptions);
+    // A delayed response from a former account must not erase a newer login cookie.
+    // Scoped clients only revoke their token; an inert cookie is replaced on the next login.
+    if (expectedAccount(request) === undefined) reply.clearCookie('session', cookieOptions);
     return { ok: true };
   });
 
