@@ -1,7 +1,6 @@
 import Fastify, { type FastifyReply, type FastifyRequest } from 'fastify';
 import cookie from '@fastify/cookie';
 import rateLimit from '@fastify/rate-limit';
-import staticFiles from '@fastify/static';
 import Database from 'better-sqlite3';
 import { AsyncSqlite } from './database/sqlite.js';
 import { AsyncPostgres } from './database/postgres.js';
@@ -1035,6 +1034,7 @@ export async function createApp(options: AppOptions) {
   });
 
   if (options.staticRoot && existsSync(options.staticRoot)) {
+    const { default: staticFiles } = await import('@fastify/static');
     await app.register(staticFiles, { root: options.staticRoot, prefix: '/' });
     app.setNotFoundHandler((request, reply) => {
       if (request.method === 'GET' && !request.url.startsWith('/api/')) return reply.sendFile('index.html');

@@ -20,7 +20,9 @@ try {
     getCurrentDirectory: () => root, getCanonicalFileName: (name) => name, getNewLine: () => '\n',
   }));
   const entry = pathToFileURL(join(output, 'api/handler.js')).href;
-  const result = spawnSync(process.execPath, ['--input-type=module', '-e', 'await import(process.argv[1])', entry], { cwd: root, encoding: 'utf8' });
-  if (result.status !== 0) throw new Error(result.stderr || 'Node could not import the emitted Function');
+  for (const flags of [[], ['--no-experimental-require-module']]) {
+    const result = spawnSync(process.execPath, [...flags, '--input-type=module', '-e', 'await import(process.argv[1])', entry], { cwd: root, encoding: 'utf8' });
+    if (result.status !== 0) throw new Error(result.stderr || 'Node could not import the emitted Function');
+  }
   console.log('Node imported the emitted Vercel Function successfully.');
 } finally { rmSync(output, { recursive: true, force: true }); }
