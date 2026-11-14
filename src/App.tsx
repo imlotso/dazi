@@ -29,7 +29,7 @@ import { RecordsView } from './components/RecordsView';
 import { SettingsDialog } from './components/SettingsDialog';
 import { StatsView } from './components/StatsView';
 import { articles, type Difficulty, type Language } from './data/articles';
-import { continuationDraftId, discardSavedDraft, localHistory, practiceDraftId, readDraft, readDrafts, savedPracticeFromLegacy, usePractice, type PracticeDraft } from './hooks/usePractice';
+import { continuationDraftId, discardSavedDraft, draftAwaitingStart, localHistory, practiceDraftId, readDraft, readDrafts, savedPracticeFromLegacy, usePractice, type PracticeDraft } from './hooks/usePractice';
 import { useWorkspace } from './hooks/useWorkspace';
 import { api, type User } from './lib/api';
 import { catalogSnapshotKey, type ArticleSnapshot, type PracticeRecord, type ReaderSettings, type SavedPractice } from './lib/models';
@@ -66,6 +66,7 @@ function legacyArticle(draft: PracticeDraft): ArticleSnapshot {
 
 function mergeRecords(local: PracticeRecord[], remote: PracticeRecord[], workspace: PracticeRecord[]) {
   const recordKey = (record: PracticeRecord) => record.recordId || `${record.finishedAt}:${record.language}:${record.difficulty}:${record.speed}:${record.accuracy}`;
+  const onlineRecords = new Set(remote.map(recordKey));
   const statuses = new Map(remote.flatMap((record) => record.status ? [[recordKey(record), record.status] as const] : []));
   const entries = new Map<string, PracticeRecord>();
   for (const record of [...local, ...remote, ...workspace]) {
@@ -78,7 +79,7 @@ function mergeRecords(local: PracticeRecord[], remote: PracticeRecord[], workspa
   }
   return [...entries].map(([key, record]) => {
     const status = statuses.get(key);
-    return status ? { ...record, status } : record;
+    return { ...record, ...(status && { status }), ...(onlineRecords.has(key) && { localOnly: false }) };
   }).sort((a, b) => b.finishedAt - a.finishedAt);
 }
 
@@ -238,7 +239,7 @@ function PracticeApp({ user, authReady, onUser, onAdministration }: { user: User
     bootstrapped.current = true;
     const deleted = new Set(workspace.deletedDraftIds);
     const preferred = readDraft(ownerId);
-    const recoverable = (draft: PracticeDraft) => draft.completed || !deleted.has(practiceDraftId(draft.recordId));
+    const recoverable = (draft: PracticeDraft) => !draftAwaitingStart(draft) && (draft.completed || !deleted.has(practiceDraftId(draft.recordId)));
     const legacy = preferred && recoverable(preferred) ? preferred : readDrafts(ownerId).find(recoverable);
     if (!interacted.current && phase === 'ready' && legacy) {
       setSelection(legacyArticle(legacy));
@@ -295,6 +296,7 @@ function PracticeApp({ user, authReady, onUser, onAdministration }: { user: User
     const deleted = new Set(workspace.deletedDraftIds);
     const completed: PracticeDraft[] = [];
     for (const draft of readDrafts(ownerId)) {
+      if (draftAwaitingStart(draft)) continue;
       if (draft.completed) {
         drafts.delete(draft.recordId);
         completed.push(draft);
@@ -600,15 +602,15 @@ function PracticeApp({ user, authReady, onUser, onAdministration }: { user: User
               <div className="practice-actions">
                 {phase === 'running' ? <button className="primary-button start-button" onClick={() => void practice.pause()}><Pause size={18} weight="fill" aria-hidden="true" /> 暂停练习</button>
                   : phase === 'paused' ? <button className="primary-button start-button" disabled={!ready || accountBusy} onClick={() => void practice.resume()}><Play size={18} weight="fill" aria-hidden="true" /> 继续练习</button>
-                    : <button className="primary-button start-button" onClick={phase === 'finished' ? () => resetPractice(selection, true) : () => { interacted.current = true; void practice.start(); }} disabled={!canStart}>
-                      {phase === 'starting' ? '准备中…' : phase === 'restoring' ? '恢复进度中…' : phase === 'pausing' ? '正在暂停…' : phase === 'resuming' ? '正在继续…' : phase === 'finishing' ? '正在结算…' : phase === 'finished' ? '再练一次' : <><Play size={18} weight="fill" aria-hidden="true" /> 开始练习</>}
+                    : phase === 'ready' ? null : <button className="primary-button start-button" onClick={() => resetPractice(selection, true)} disabled={phase !== 'finished' || !canStart}>
+                      {phase === 'starting' ? '准备中…' : phase === 'restoring' ? '恢复进度中…' : phase === 'pausing' ? '正在暂停…' : phase === 'resuming' ? '正在继续…' : phase === 'finishing' ? '正在结算…' : '再练一次'}
                     </button>}
                 {(phase === 'running' || phase === 'paused') && <><button className="text-button restart-button" onClick={() => void requestPracticeAction('restart')}><ArrowCounterClockwise size={18} aria-hidden="true" />重新开始</button><button className="text-button" onClick={() => void requestPracticeAction('finish')}>结束练习</button></>}
                 {phase === 'ready' && !focused && <button className="text-button" onClick={nextArticle}>换一篇 <ArrowRight size={16} aria-hidden="true" /></button>}
                 {phase === 'finished' && <button className="text-button" onClick={() => setShowResult(true)}>查看本次成绩</button>}
               </div>
             </div>
-            <PracticeLines practice={practice} title={displayTitle} reader={workspace.settings} />
+            <PracticeLines practice={practice} title={displayTitle} reader={workspace.settings} canStart={canStart} onStart={() => { interacted.current = true; }} />
           </section>
           {practiceNotice && <p className="practice-notice" role="status">{practiceNotice}</p>}
         </>}

@@ -193,7 +193,6 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .line-source, .typing-panel .line-pair textarea { font-family: ui-monospace, 'SFMono-Regular', Consolas, 'Liberation Mono', 'Noto Sans Mono CJK SC', monospace; font-size: 18px; line-height: 28px; letter-spacing: 0; font-variant-ligatures: none; tab-size: 4; }
 .line-source { padding: 0 12px; color: var(--typing-text); min-height: 28px; white-space: pre; overflow: hidden; }
 .practice-line:not(.line-active):not(.line-completed) .line-source { color: var(--typing-muted); }
-.space-character { opacity: .5; }
 .typing-panel .line-pair textarea { display: block; width: 100%; resize: none; height: 44px; min-height: 44px; max-height: 44px; margin-top: 6px; padding: 7px 11px; color: var(--typing-text); background: var(--typing-input); border: 1px solid var(--typing-border); border-radius: 7px; overflow-x: auto; overflow-y: hidden; scrollbar-width: none; }
 .typing-panel .line-pair textarea:disabled { opacity: 1; -webkit-text-fill-color: var(--typing-text); }
 .typing-panel .line-pair textarea:focus { border-color: var(--typing-accent); outline: 2px solid var(--typing-accent); outline-offset: 1px; }

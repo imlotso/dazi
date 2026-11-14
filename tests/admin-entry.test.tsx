@@ -81,7 +81,7 @@ it('keeps a normal account in the practice interface after shared login', async 
   loginAs = member;
   render(<App />); await signIn();
   await screen.findByRole('button', { name: /reader/ });
-  expect(screen.getByRole('button', { name: '开始练习' })).toBeTruthy();
+  expect(screen.getByRole('textbox', { name: '当前行输入' })).toBeTruthy();
   expect(screen.queryByRole('heading', { name: '管理后台' })).toBeNull();
   expect(screen.queryByRole('button', { name: '管理后台' })).toBeNull();
   expect(window.location.pathname).toBe('/');
@@ -91,13 +91,12 @@ it('returns from an explicit site preview through the account entry and preserve
   account = admin; render(<App />);
   fireEvent.click(await screen.findByRole('button', { name: '预览网站' }));
   expect(screen.queryByRole('button', { name: '管理后台' })).toBeNull();
-  fireEvent.click(screen.getByRole('button', { name: '自定义文字' }));
+  fireEvent.click(await screen.findByRole('button', { name: '自定义文字' }));
   fireEvent.change(screen.getByRole('textbox', { name: '自定义文章内容' }), { target: { value: '甲乙丙丁' } });
   fireEvent.click(screen.getByRole('button', { name: '使用这段文字' }));
-  const start = screen.getByRole('button', { name: '开始练习' });
-  await waitFor(() => expect((start as HTMLButtonElement).disabled).toBe(false));
-  fireEvent.click(start); await screen.findByRole('button', { name: '暂停练习' });
-  fireEvent.change(screen.getByRole('textbox', { name: '当前行输入' }), { target: { value: '甲乙' } });
+  const input = screen.getByRole('textbox', { name: '当前行输入' }) as HTMLTextAreaElement;
+  await waitFor(() => expect(input.disabled).toBe(false));
+  fireEvent.change(input, { target: { value: '甲乙' } });
   fireEvent.click(screen.getByTitle('返回管理界面'));
   await screen.findByRole('heading', { name: '管理后台' });
   fireEvent.click(screen.getByRole('button', { name: '预览网站' }));

@@ -412,6 +412,9 @@ export async function createApp(options: AppOptions) {
     const duration = Number(body.duration);
     const mode = body.mode === undefined ? 'timed' : body.mode;
     const strict = body.strict === undefined ? false : body.strict;
+    if (body.clientId !== undefined && (typeof body.clientId !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(body.clientId))) {
+      return invalid(reply, '练习标识无效');
+    }
     if (!article || !isValidDuration(duration)) return invalid(reply, '请选择有效文章和时长');
     if (body.articleKey !== undefined && body.articleKey !== catalogSnapshotKey({ ...article, text: article.content, custom: false })) {
       return invalid(reply, '文章已更新，请重新选择', 409);
@@ -419,13 +422,14 @@ export async function createApp(options: AppOptions) {
     if (!isPracticeMode(mode) || typeof strict !== 'boolean') return invalid(reply, '练习模式无效');
     const owner = getOwner(request, reply)!;
     const target = article.content;
-    const id = randomUUID();
+    const id = body.clientId ?? randomUUID();
     const startedAt = now();
     const { content, ...articleMetadata } = article;
-    db.prepare(`INSERT INTO challenges(id,owner,language,difficulty,duration,target,started_at,active_started_at,article_id,article_metadata,mode,strict)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`)
+    const created = db.prepare(`INSERT INTO challenges(id,owner,language,difficulty,duration,target,started_at,active_started_at,article_id,article_metadata,mode,strict)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO NOTHING`)
       .run(id, owner, article.language, article.difficulty, duration, content, startedAt, startedAt, article.id,
         JSON.stringify({ ...articleMetadata, custom: false }), mode, Number(strict));
+    if (!created.changes) return invalid(reply, '练习无法创建', 409);
     return { id, target, duration };
   });
 
