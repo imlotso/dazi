@@ -73,13 +73,22 @@ pg_restore --exit-on-error --single-transaction --no-owner --no-acl \
 
 ## 回滚
 
-切换前保留已验证的 SQLite 快照和旧应用版本。若 PostgreSQL 从未接受新写入，可停写后切回原 SQLite 快照；若已经接受写入，不能直接切回旧快照，否则会丢失切换后的数据。先进入维护状态并停止所有写入，备份 PostgreSQL，再将当前数据导出到**不存在的新文件**：
+切换前保留已验证的 SQLite 快照和旧应用版本。若 PostgreSQL 从未接受新写入，可停写后切回原 SQLite 快照；若已经接受写入，不能直接切回旧快照，否则会丢失切换后的数据。
+
+本次新建生产库使用独立的 Neon 数据库角色。需要停写时，先确认没有其他写入方，将现有应用连接信息暂存在私密环境，再在 Neon 的生产分支中重置该角色的密码；该操作会断开计算端点的连接。暂不更新 Vercel 的旧生产连接配置，让应用无法用旧密码重连。使用新的直连配置确认旧凭据无法连接，并检查同角色没有除维护连接之外的会话；若任一检查失败，继续保持维护状态，不做备份切换。此操作会中断服务，执行前须确认目标项目、分支和角色。可通过维护连接执行以下只读检查，结果须为零：
+
+```sql
+SELECT count(*) AS other_sessions FROM pg_stat_activity
+WHERE usename = current_user AND pid <> pg_backend_pid();
+```
+
+停写确认后备份 PostgreSQL，再将当前数据导出到**不存在的新文件**：
 
 ```bash
 npm run db:postgres -- export /安全路径/新回滚快照.sqlite
 ```
 
-导出使用 PostgreSQL 一致性快照，逐表核对内容并保留审计序列，拒绝覆盖已有文件。核验新 SQLite 文件、与原 `CODE_SECRET` 配套的 SMTP 密文以及关键账号/练习/排行数据后，才可在用户另行授权的维护窗口里切换回旧应用。导出开始后到停写完成之间的任何新写入都不在快照中，因此必须先停写；验证失败时保留 PostgreSQL 和备份，不执行切换。
+导出使用 PostgreSQL 一致性快照，逐表核对内容并保留审计序列，拒绝覆盖已有文件。核验新 SQLite 文件、与原 `CODE_SECRET` 配套的 SMTP 密文以及关键账号/练习/排行数据后，才可在用户另行授权的维护窗口里切换回旧应用。若恢复到兼容的 PostgreSQL 应用版本，须先将 Vercel Production 的 `DATABASE_URL` 更新为新密码对应的池化连接，再部署经过验证的版本。首次上线没有可回退的 Vercel 生产版本时，应保持服务不可写，直到恢复目标准备并验证完毕。验证失败时保留 PostgreSQL 和备份，不执行切换。
 
 ## 当前验证范围
 
