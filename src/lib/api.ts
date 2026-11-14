@@ -1,5 +1,5 @@
 export class ApiError extends Error {
-  constructor(message: string, public readonly status: number) {
+  constructor(message: string, public readonly status: number, public readonly code?: string, public readonly claimVersion?: number) {
     super(message);
     this.name = 'ApiError';
   }
@@ -35,7 +35,10 @@ export async function api<T>(path: string, options?: { method?: 'GET' | 'POST'; 
       throw new Error(response.ok ? '服务返回的数据无法读取' : '操作未完成，请稍后重试');
     }
     if (!data || typeof data !== 'object' || Array.isArray(data)) throw new Error('服务返回的数据无法读取');
-    if (!response.ok) throw new ApiError((data as { error?: string }).error || '操作未完成，请稍后重试', response.status);
+    if (!response.ok) {
+      const failure = data as { error?: string; code?: string; claimVersion?: number; currentClaimVersion?: number };
+      throw new ApiError(failure.error || '操作未完成，请稍后重试', response.status, failure.code, failure.currentClaimVersion ?? failure.claimVersion);
+    }
     return data as T;
   } finally {
     clearTimeout(timeout);

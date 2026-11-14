@@ -1,4 +1,5 @@
-import { expect, test, type APIRequestContext } from '@playwright/test';
+import { expect, test } from './fixtures';
+import type { APIRequestContext } from '@playwright/test';
 import { articles } from '../src/data/articles';
 
 test('starts on the first keystroke, keeps spaces blank, and preserves punctuation', async ({ page }) => {
@@ -130,7 +131,7 @@ test('keeps confirmed text, mistakes and backspaces across pause and reload', as
   expect((await paused).status()).toBe(200);
   await expect(page.getByRole('button', { name: '继续练习' })).toBeEnabled();
   const remaining = await page.getByTestId('remaining-time').textContent();
-  const restored = page.waitForResponse((response) => response.url().endsWith(`/api/tests/${id}/pause`) && response.request().method() === 'POST');
+  const restored = page.waitForResponse((response) => response.url().endsWith('/api/tests/recover') && response.request().method() === 'POST');
   await page.reload();
   expect((await restored).status()).toBe(200);
   await expect(page.getByRole('button', { name: '继续练习' })).toBeEnabled();

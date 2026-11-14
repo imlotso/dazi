@@ -16,7 +16,7 @@ export const targets = { user: '用户', article: '文章', score: '成绩' };
 export const reasonLabels: Record<string, string> = {
   paste_or_drop: '粘贴或拖放', unusual_progress: '输入进度异常', missing_activity: '进度记录不足',
   stale_activity: '结束前缺少进度记录', high_speed: '速度较高', paused_session: '曾暂停或恢复',
-  timing_discrepancy: '计时差异较大',
+  timing_discrepancy: '计时差异较大', recovered_session: '恢复中断练习',
 };
 const actionLabels: Record<string, string> = {
   'user.bootstrap': '初始化管理员', 'user.disable': '停用账号', 'user.enable': '启用账号', 'user.promote': '设为管理员', 'user.demote': '撤销管理员', 'user.revoke_sessions': '退出所有会话',
