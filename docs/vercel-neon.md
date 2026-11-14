@@ -54,7 +54,7 @@ unset DAZI_ADMIN_PASSWORD
 ## 备份、验证与恢复
 
 - SQLite：沿用 `scripts/backup.mjs` 的在线备份接口，备份数据库时也要在独立安全位置保存原 `CODE_SECRET`。导入前保留原始文件和备份，停止写入并核验备份；不要直接复制运行中 SQLite 主文件而忽略 WAL。
-- PostgreSQL：使用与服务器主版本兼容的 `pg_dump` / `pg_restore`。在私密环境设置 `PGHOST`、`PGPORT`、`PGDATABASE`、`PGUSER`、`PGSSLMODE=require` 和权限为 `0600` 的 `PGPASSFILE`；勿把带密码的 URL 放进命令参数。先确认环境指向预期分支，再执行：
+- PostgreSQL：先核对服务器和客户端版本，优先使用与服务器相同主版本且小版本不低于服务器的 `pg_dump` / `pg_restore`，并在隔离目标上演练恢复。例如，18.6 的 `pg_dump` 连接 18.7 服务器时可能导出旧恢复端无法识别的 `pg_attver` 选项。在私密环境设置 `PGHOST`、`PGPORT`、`PGDATABASE`、`PGUSER`、`PGSSLMODE=verify-full`、可信 CA 根证书 `PGSSLROOTCERT` 和权限为 `0600` 的 `PGPASSFILE`；勿把带密码的 URL 放进命令参数。精简容器可能没有系统 CA 文件，需只读挂载可信 CA 包，而不是关闭证书校验。先确认环境指向预期分支，再执行：
 
 ```bash
 umask 077
