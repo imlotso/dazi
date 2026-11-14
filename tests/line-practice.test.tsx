@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { App } from '../src/App';
 import { localHistory, readDraft } from '../src/hooks/usePractice';
+import { articles } from '../src/data/articles';
 
 beforeEach(() => {
   localStorage.clear(); sessionStorage.clear();
@@ -17,10 +18,17 @@ async function customPractice(text = '甲乙\n丙丁\n戊己') {
   fireEvent.click(screen.getByRole('button', { name: '自定义文字' }));
   fireEvent.change(screen.getByLabelText('自定义文章内容'), { target: { value: text } });
   fireEvent.click(screen.getByRole('button', { name: '使用这段文字' }));
-  await waitFor(() => expect((screen.getByRole('button', { name: '开始练习' }) as HTMLButtonElement).disabled).toBe(false));
-  fireEvent.click(screen.getByRole('button', { name: '开始练习' }));
+  await waitFor(() => expect(activeInput().disabled).toBe(false));
+  beginWithCancelledComposition();
 }
 function activeInput() { return screen.getByRole('textbox', { name: /当前行输入/ }) as HTMLTextAreaElement; }
+function beginWithCancelledComposition() {
+  const input = activeInput();
+  fireEvent.compositionStart(input);
+  fireEvent.change(input, { target: { value: 'x' } });
+  fireEvent.change(input, { target: { value: '' } });
+  fireEvent.compositionEnd(input, { data: '' });
+}
 
 describe('line-by-line practice', () => {
   it('returns the passage to its beginning when restarting after scrolling', async () => {
@@ -166,17 +174,16 @@ describe('line-by-line practice', () => {
   it('waits for online restoration before allowing the open restart dialog to discard progress', async () => {
     let resolvePause!: (value: Response) => void;
     let pauseCalls = 0;
-    vi.stubGlobal('fetch', vi.fn((url: string) => {
+    vi.stubGlobal('fetch', vi.fn((url: string, options?: RequestInit) => {
       const response = (value: unknown) => Promise.resolve({ ok: true, json: async () => value } as Response);
       if (url === '/api/me') return response({ user: null });
-      if (url === '/api/tests/start') return response({ id: 'restoring-test', target: '甲乙\n丙丁' });
+      if (url === '/api/tests/start') return response({ id: JSON.parse(String(options?.body)).clientId, target: articles[0].content });
       if (url.endsWith('/pause') && ++pauseCalls === 2) return new Promise<Response>((resolve) => { resolvePause = resolve; });
       return response({ elapsedMs: 0, remainingMs: 300000 });
     }));
     render(<App />);
-    const start = await screen.findByRole('button', { name: '开始练习' });
-    await waitFor(() => expect((start as HTMLButtonElement).disabled).toBe(false));
-    fireEvent.click(start);
+    await waitFor(() => expect(activeInput().disabled).toBe(false));
+    beginWithCancelledComposition();
     await screen.findByRole('button', { name: '暂停练习' });
     fireEvent.change(activeInput(), { target: { value: '甲' } });
     fireEvent.click(screen.getByRole('button', { name: '重新开始' }));
@@ -185,9 +192,9 @@ describe('line-by-line practice', () => {
     expect((within(dialog).getByRole('button', { name: '确认重新开始' }) as HTMLButtonElement).disabled).toBe(true);
     await act(async () => resolvePause({ ok: true, json: async () => ({ elapsedMs: 0, remainingMs: 300000 }) } as Response));
     fireEvent.click(within(dialog).getByRole('button', { name: '确认重新开始' }));
-    expect(screen.getByRole('button', { name: '开始练习' })).toBeTruthy();
+    expect(activeInput().disabled).toBe(false);
     expect(readDraft()).toBeNull();
-    fireEvent.click(screen.getByRole('button', { name: '开始练习' }));
+    beginWithCancelledComposition();
     await screen.findByRole('button', { name: '暂停练习' });
     expect(activeInput().disabled).toBe(false);
   });

@@ -1,23 +1,86 @@
 import { expect, test, type APIRequestContext } from '@playwright/test';
 import { articles } from '../src/data/articles';
 
+test('starts on the first keystroke, keeps spaces blank, and preserves punctuation', async ({ page }) => {
+  await page.goto('/');
+  await page.getByRole('button', { name: 'English' }).click();
+  await page.getByRole('button', { name: '自定义文字' }).click();
+  await page.getByRole('textbox', { name: '自定义文章内容' }).fill('Hello world.  Next sentence.');
+  await page.getByRole('button', { name: '使用这段文字' }).click();
+  const input = page.getByRole('textbox', { name: '当前行输入' });
+  const source = page.getByTestId('practice-source-0');
+  await expect(input).toBeEnabled();
+  await expect(page.getByRole('button', { name: '开始练习' })).toHaveCount(0);
+  await expect(source).toHaveText('Hello world.  Next sentence.');
+  await input.focus();
+  await page.waitForTimeout(1200);
+  await expect(page.getByTestId('remaining-time')).toHaveText('05:00');
+  await input.pressSequentially('Hello ');
+  await expect(input).toHaveValue('Hello ');
+  await expect(page.getByTestId('typed-count')).toHaveText('6');
+  await expect(page.getByRole('button', { name: '暂停练习' })).toBeVisible();
+  await expect(source).toHaveText('Hello world.  Next sentence.');
+  await expect.poll(async () => (await page.getByTestId('remaining-time').textContent()) !== '05:00').toBe(true);
+});
+
+test('keeps an online practice when the start response is delayed', async ({ page }) => {
+  let release!: () => void;
+  let received!: (id: string) => void;
+  const hold = new Promise<void>((resolve) => { release = resolve; });
+  const started = new Promise<string>((resolve) => { received = resolve; });
+  await page.route('**/api/tests/start', async (route) => {
+    const response = await route.fetch();
+    received((await response.json()).id);
+    await hold;
+    await route.fulfill({ response });
+  });
+  await page.goto('/');
+  const input = page.getByRole('textbox', { name: '当前行输入' });
+  await input.fill('我与');
+  const id = await started;
+  await expect(page.getByTestId('typed-count')).toHaveText('2');
+  await expect.poll(async () => (await page.getByTestId('remaining-time').textContent()) !== '05:00').toBe(true);
+  release();
+  await expect.poll(async () => await page.evaluate((attemptId) => {
+    const current = sessionStorage.getItem('cloudtyping.current-practice.v2');
+    const draft = current ? JSON.parse(localStorage.getItem('cloudtyping.practice.v2.' + current) || 'null') : null;
+    return draft?.id === attemptId && draft?.offline === false;
+  }, id)).toBe(true);
+  const paused = page.waitForResponse((response) => response.url().endsWith(`/api/tests/${id}/pause`));
+  await page.getByRole('button', { name: '暂停练习' }).click();
+  expect((await paused).status()).toBe(200);
+  await expect(page.getByRole('button', { name: '继续练习' })).toBeEnabled();
+});
+
+test('starts with the duration most recently entered', async ({ page }) => {
+  await page.goto('/');
+  await page.getByRole('spinbutton', { name: '测试时间（分钟）' }).fill('1');
+  const request = page.waitForRequest((entry) => entry.url().endsWith('/api/tests/start') && entry.method() === 'POST');
+  await page.getByRole('textbox', { name: '当前行输入' }).fill('我');
+  expect((await request).postDataJSON().duration).toBe(60);
+  const remaining = await page.getByTestId('remaining-time').textContent();
+  expect(['01:00', '00:59', '00:58']).toContain(remaining);
+  await expect(page.getByRole('spinbutton', { name: '测试时间（分钟）' })).toHaveValue('1');
+});
+
 test('selects language and difficulty and validates the 1–60 minute limit', async ({ page }) => {
   await page.goto('/');
   const minutes = page.getByRole('spinbutton', { name: '测试时间（分钟）' });
-  const start = page.getByRole('button', { name: '开始练习' });
-  await expect(start).toBeEnabled();
+  const input = page.getByRole('textbox', { name: '当前行输入' });
+  await expect(page.getByRole('button', { name: '开始练习' })).toHaveCount(0);
+  await expect(input).toBeEnabled();
   await expect(minutes).toHaveValue('5');
   await minutes.fill('0');
-  await expect(start).toBeDisabled();
+  await expect(input).toBeDisabled();
   await minutes.fill('61');
-  await expect(start).toBeDisabled();
+  await expect(input).toBeDisabled();
   await minutes.fill('1.5');
-  await expect(start).toBeDisabled();
+  await expect(input).toBeDisabled();
   await minutes.fill('60');
-  await expect(start).toBeEnabled();
+  await expect(input).toBeEnabled();
   await expect(page.getByTestId('remaining-time')).toHaveText('60:00');
   await minutes.fill('1');
-  await expect(start).toBeEnabled();
+  await expect(input).toBeEnabled();
   await page.getByRole('button', { name: 'English' }).click();
   await page.getByRole('button', { name: '挑战' }).click();
   const article = page.getByLabel('选择练习文章');
@@ -51,13 +114,12 @@ test('keeps the main controls accessible on a small phone', async ({ page }) => 
 test('keeps confirmed text, mistakes and backspaces across pause and reload', async ({ page }) => {
   await page.goto('/');
   const started = page.waitForResponse((response) => response.url().endsWith('/api/tests/start') && response.request().method() === 'POST');
-  await page.getByRole('button', { name: '开始练习' }).click();
+  const input = page.getByRole('textbox', { name: /当前行输入/ });
+  await input.fill('我与父亲错');
   const startResponse = await started;
   expect(startResponse.status()).toBe(200);
   const { id } = await startResponse.json();
-  const input = page.getByRole('textbox', { name: /当前行输入/ });
   await expect(input).toBeEnabled();
-  await input.fill('我与父亲错');
   await expect(page.getByTestId('typed-count')).toHaveText('5');
   await expect(page.getByTestId('error-count')).toHaveText('1');
   await input.press('Backspace');
@@ -83,7 +145,6 @@ test('keeps confirmed text, mistakes and backspaces across pause and reload', as
 
 test('counts simulated Chinese composition only after confirmation', async ({ page }) => {
   await page.goto('/');
-  await page.getByRole('button', { name: '开始练习' }).click();
   const input = page.getByRole('textbox', { name: /当前行输入/ });
   await expect(input).toBeEnabled();
   await input.dispatchEvent('compositionstart', { data: '' });
@@ -100,7 +161,6 @@ test('shows a result immediately when a custom article is completed', async ({ p
   await page.getByRole('button', { name: '自定义文字' }).click();
   await page.getByRole('textbox', { name: '自定义文章内容' }).fill('你好世界');
   await page.getByRole('button', { name: '使用这段文字' }).click();
-  await page.getByRole('button', { name: '开始练习' }).click();
   const input = page.getByRole('textbox', { name: /当前行输入/ });
   await expect(input).toBeEnabled();
   await input.fill('你好世界');
@@ -115,7 +175,7 @@ test('submits an online result, registers an admin with a test email and publish
   const target = await page.locator('.line-source').evaluateAll((lines) => lines.map((line) => line.getAttribute('data-text')).join(''));
   expect(target).toBeTruthy();
   const started = page.waitForResponse((response) => response.url().endsWith('/api/tests/start') && response.request().method() === 'POST');
-  await page.getByRole('button', { name: '开始练习' }).click();
+  await page.getByRole('textbox', { name: /当前行输入/ }).fill(target!.slice(0, 1));
   const startResponse = await started;
   expect(startResponse.status()).toBe(200);
   const { id } = await startResponse.json();
@@ -219,7 +279,7 @@ test('manages a live account and publishes a sourced article into the practice c
   await memberLogin.getByLabel('密码', { exact: true }).fill(password);
   await memberLogin.getByRole('button', { name: '登录', exact: true }).click();
   await expect(reader.getByTitle('退出登录')).toContainText('admin_e2e_reader');
-  await expect(reader.getByRole('button', { name: '开始练习', exact: true })).toBeVisible();
+  await expect(reader.getByRole('textbox', { name: '当前行输入' })).toBeEnabled();
   await expect(reader.getByRole('button', { name: '管理后台', exact: true })).toHaveCount(0);
   expect((await reader.request.get('/api/admin/overview')).status()).toBe(403);
   const owner = await page.request.post('/api/auth/login', { data: { identifier: 'admin@example.test', password } });
@@ -285,7 +345,7 @@ test('manages a live account and publishes a sourced article into the practice c
   await reader.getByRole('searchbox', { name: '搜索' }).fill('浏览器验证文章');
   await reader.getByRole('button', { name: '练习《浏览器验证文章》' }).click();
   const started = reader.waitForResponse((response) => response.url().endsWith('/api/tests/start') && response.request().method() === 'POST');
-  await reader.getByRole('button', { name: '开始练习', exact: true }).click();
+  await reader.getByRole('textbox', { name: '当前行输入' }).fill(body.slice(0, 1));
   const challenge = await started;
   expect(challenge.status()).toBe(200);
   expect((await challenge.json()).target).toBe(body.trim());

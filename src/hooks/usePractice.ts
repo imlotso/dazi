@@ -19,7 +19,7 @@ export type PracticeResult = { score: Score; attemptId?: string; status?: string
 type Attempt = RoundConfig & {
   id?: string; recordId: string; revision: number; legacy?: boolean; target: string;
   offline: boolean; elapsedMs: number; startedAt: number | null; suspicious: boolean;
-  backspaces: number; nextCheckpointMs: number; offset?: number; mistakes?: MistakeSample[];
+  backspaces: number; nextCheckpointMs: number; offset?: number; mistakes?: MistakeSample[]; pendingStart?: boolean;
 };
 export type PracticeDraft = Omit<Attempt, 'startedAt' | 'nextCheckpointMs'> & { version: 1; typed: string; completed?: boolean; early?: boolean; savedAt?: number; leaseOwner?: string | null; leaseAt?: number };
 export type History = PracticeRecord;
@@ -34,7 +34,17 @@ const draftPrefix = 'cloudtyping.practice.v2.';
 const currentDraftKey = 'cloudtyping.current-practice.v2';
 const historyKey = 'cloudtyping.history.v1';
 const uniqueId = () => `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+function clientChallengeId() {
+  try {
+    if (typeof globalThis.crypto?.randomUUID === 'function') return globalThis.crypto.randomUUID();
+    const bytes = globalThis.crypto.getRandomValues(new Uint8Array(16));
+    bytes[6] = (bytes[6] & 15) | 64; bytes[8] = (bytes[8] & 63) | 128;
+    const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
+    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+  } catch { return undefined; }
+}
 const leaseTaken = (draft: PracticeDraft, owner: string) => !!draft.leaseOwner && draft.leaseOwner !== owner && typeof draft.leaseAt === 'number' && Date.now() - draft.leaseAt < 15_000;
+export const draftAwaitingStart = (draft: PracticeDraft) => !!draft.pendingStart && leaseTaken(draft, '');
 const validDuration = (seconds: number) => Number.isInteger(seconds) && seconds >= 60 && seconds <= 3600 && seconds % 60 === 0;
 const durationLimit = (round: Pick<RoundConfig, 'mode' | 'duration'>) => round.mode === 'article' ? articleLimitMs : round.duration * 1000;
 const validAttemptId = (id: string) => /^[\w-]{1,80}$/.test(id);
@@ -167,7 +177,7 @@ function recordResult(attempt: Attempt, result: PracticeResult, typed: string): 
   return {
     language: attempt.language, difficulty: attempt.difficulty, duration: attempt.duration, speed: attempt.language === 'zh' ? result.score.cpm : result.score.wpm,
     accuracy: result.score.accuracy, finishedAt: Date.now(), status: result.status, elapsedMs: Math.round(result.elapsedMs), backspaces: result.backspaces, errors: result.errors,
-    recordId: attempt.recordId, ownerId: attempt.ownerId, localOnly: result.offline, article: articleSnapshot(attempt, attempt.target), typed,
+    recordId: result.attemptId ?? attempt.recordId, ownerId: attempt.ownerId, localOnly: result.offline, article: articleSnapshot(attempt, attempt.target), typed,
     offset: attempt.offset ?? 0, total: result.score.total, correct: result.score.correct, articleTotal: result.articleTotal,
     mode: attempt.mode ?? 'timed', strict: !!attempt.strict, mistakes: [...(attempt.mistakes ?? [])],
   };
@@ -224,8 +234,10 @@ export function usePractice(config: PracticeConfig, initialDraft: PracticeDraft 
   const [result, setResult] = useState<PracticeResult | null>(null);
   const [restored, setRestored] = useState(!!draft);
   const attemptRef = useRef<Attempt | null>(restoredAttempt);
+  const pendingStart = useRef<{ attempt: Attempt; promise: Promise<void> } | null>(null);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const composing = useRef(false);
+  const pendingSuspicious = useRef(false);
   const lastBackspaceKey = useRef(-Infinity);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const mounted = useRef(true);
@@ -247,14 +259,14 @@ export function usePractice(config: PracticeConfig, initialDraft: PracticeDraft 
     if (deleted || (existing && (leaseTaken(existing, ownerToken.current) || (existing.revision ?? 0) > attempt.revision)) ||
       (!existing && attempt.revision > 0 && !attempt.legacy)) {
       if (deleted) clearDraft(attempt, ownerToken.current);
-      attempt.recordId = uniqueId(); attempt.revision = 0; attempt.id = undefined; attempt.offline = true; attempt.legacy = false;
+      attempt.recordId = uniqueId(); attempt.revision = 0; attempt.id = undefined; attempt.offline = true; attempt.legacy = false; attempt.pendingStart = false;
       setFeedback(!deleted && existing ? '原进度正在其他标签页使用，已另存。' : '原草稿已移除，已另存。');
       return true;
     }
     return false;
   };
   const emitDraft = (attempt: Attempt, typed: string, force = false, snapshot?: SavedPractice) => {
-    if (isDeleted(attempt) || (!force && performance.now() - lastWorkspaceSave.current < draftIntervalMs)) return;
+    if (attempt.pendingStart || isDeleted(attempt) || (!force && performance.now() - lastWorkspaceSave.current < draftIntervalMs)) return;
     lastWorkspaceSave.current = performance.now();
     const outgoing = snapshot ?? workspaceDraft(attempt, typed);
     const recover = () => {
@@ -275,9 +287,10 @@ export function usePractice(config: PracticeConfig, initialDraft: PracticeDraft 
 
   const settle = (attempt: Attempt, final: PracticeResult, typed: string) => {
     const entry = recordResult(attempt, final, typed);
-    const alreadyRecorded = recorded.current.has(attempt.recordId) || localHistory().some((item) => item.recordId === attempt.recordId && item.ownerId === attempt.ownerId);
+    const recordId = final.attemptId ?? attempt.recordId;
+    const alreadyRecorded = recorded.current.has(recordId) || localHistory().some((item) => item.recordId === recordId && item.ownerId === attempt.ownerId);
     if (!alreadyRecorded) {
-      recorded.current.add(attempt.recordId);
+      recorded.current.add(recordId);
       rememberHistory(entry);
       notify(liveConfig.current.onRecord, entry);
     }
@@ -287,7 +300,7 @@ export function usePractice(config: PracticeConfig, initialDraft: PracticeDraft 
     const nextOffset = continuationOffset(attempt.strict, offset, characters, expected);
     if (nextOffset < final.articleTotal) {
       const next: Attempt = {
-        ...attempt, id: undefined, recordId: nextRecordId(attempt.recordId), revision: 0, legacy: false,
+        ...attempt, id: undefined, recordId: nextRecordId(recordId), revision: 0, legacy: false,
         offline: true, elapsedMs: 0, startedAt: null, nextCheckpointMs: 5000,
         suspicious: false, backspaces: 0, offset: nextOffset, mistakes: [],
       };
@@ -371,10 +384,11 @@ export function usePractice(config: PracticeConfig, initialDraft: PracticeDraft 
 
   async function loadLegacy(saved: PracticeDraft) {
     if ((saved.ownerId ?? null) !== liveConfig.current.ownerId || !mounted.current) return;
+    if (draftAwaitingStart(saved) && saved.leaseOwner !== ownerToken.current) return;
     const previous = attemptRef.current;
     if (previous && phaseRef.current === 'running' && !await park()) return;
     if (previous !== attemptRef.current || !mounted.current || (saved.ownerId ?? null) !== liveConfig.current.ownerId) return;
-    const attempt: Attempt = { ...saved, startedAt: null, nextCheckpointMs: saved.elapsedMs + 5000 };
+    const attempt: Attempt = { ...saved, pendingStart: false, startedAt: null, nextCheckpointMs: saved.elapsedMs + 5000 };
     bindAttempt(attempt, saved.typed);
     if (!saved.completed) ensureOwnership(attempt);
     if (saved.completed || (attempt.id && !attempt.offline)) {
@@ -390,8 +404,16 @@ export function usePractice(config: PracticeConfig, initialDraft: PracticeDraft 
     const onPageHide = () => {
       const attempt = attemptRef.current;
       if (!attempt || parked.current) return;
-      const saved = storedDraft(attempt.recordId);
+      let saved = storedDraft(attempt.recordId);
+      if (attempt.pendingStart) {
+        ++startRequest.current; attempt.pendingStart = false;
+        if (phaseRef.current === 'finishing') saveDraft(attempt, typedRef.current, ownerToken.current, true, !!saved?.early);
+        else if (phaseRef.current !== 'running') saveDraft(attempt, typedRef.current, ownerToken.current);
+        if (phaseRef.current === 'pausing') setCurrentPhase('paused');
+        saved = storedDraft(attempt.recordId);
+      }
       if (phaseRef.current === 'running') {
+        ++startRequest.current;
         const used = elapsedTime(attempt);
         composing.current = false; setRaw(typedRef.current);
         attempt.elapsedMs = used; attempt.startedAt = null; clearTimer(); setElapsedMs(used); setCurrentPhase('paused');
@@ -444,6 +466,19 @@ export function usePractice(config: PracticeConfig, initialDraft: PracticeDraft 
     const value = typedRef.current;
     composing.current = false; setRaw(value);
     ensureOwnership(attempt);
+    const savedLocally = saveDraft(attempt, value, ownerToken.current, true, early);
+    if (pendingStart.current?.attempt === attempt) await pendingStart.current.promise;
+    if (!isCurrent(attempt, 'finishing')) return;
+    let latestDraft = storedDraft(attempt.recordId);
+    if (savedLocally && latestDraft && !latestDraft.leaseOwner && latestDraft.revision === attempt.revision && !isDeleted(attempt)) {
+      saveDraft(attempt, value, ownerToken.current, true, early);
+      latestDraft = storedDraft(attempt.recordId);
+    }
+    if (savedLocally && (!latestDraft || latestDraft.leaseOwner !== ownerToken.current || latestDraft.revision !== attempt.revision || isDeleted(attempt))) {
+      setResult(localResult(attempt, used, value)); setCurrentPhase('finished'); return;
+    }
+    // Save the final online identity as well, so a reload can recover the
+    // result even when the start response arrived during settlement.
     saveDraft(attempt, value, ownerToken.current, true, early);
     let final = localResult(attempt, used, value);
     if (attempt.id && !attempt.offline) {
@@ -470,6 +505,55 @@ export function usePractice(config: PracticeConfig, initialDraft: PracticeDraft 
       if (Math.floor(used / 1000) !== Math.floor(Math.max(0, used - 100) / 1000)) persist(attempt);
     }, 100);
   }, [finish, persist]);
+
+  // Start locally on the first edit so server setup never delays typing or the
+  // clock. Pause and settlement coordinate with the bounded setup request.
+  function startFromInput() {
+    const settings = liveConfig.current;
+    if (phaseRef.current !== 'ready' || !validDuration(settings.duration) || !settings.text) return;
+    const request = ++startRequest.current;
+    const { articleId, title, language, difficulty, duration, custom, ownerId, article, mode = 'timed', strict = false } = settings;
+    const clientId = custom ? undefined : clientChallengeId();
+    const attempt: Attempt = {
+      articleId, title, language, difficulty, duration, custom, ownerId, article, mode, strict,
+      text: settings.text, recordId: clientId ?? uniqueId(), revision: 0, target: settings.text, offline: true, pendingStart: !!clientId,
+      elapsedMs: 0, startedAt: performance.now(), suspicious: pendingSuspicious.current,
+      backspaces: 0, nextCheckpointMs: 5000, offset: 0, mistakes: [],
+    };
+    const originalRecordId = attempt.recordId;
+    pendingSuspicious.current = false;
+    parked.current = false; lastBackspaceKey.current = -Infinity;
+    targetCharacters.current = null; committedCharacters.current = null;
+    attemptRef.current = attempt; setTarget(attempt.target); setFeedback(''); setResult(null); setRestored(false);
+    setBackspaces(0); setElapsedMs(0); setCurrentPhase('running'); persist(attempt, true); beginClock();
+    if (!custom && clientId) {
+      const current = () => mounted.current && attemptRef.current === attempt && startRequest.current === request &&
+        attempt.recordId === originalRecordId && ['running', 'pausing', 'finishing'].includes(phaseRef.current);
+      const promise = (async () => {
+        try {
+          const challenge = await api<{ id: string; target: string }>('/api/tests/start', {
+            method: 'POST', timeoutMs: 3000, headers: { 'X-Workspace-Owner': ownerId ?? 'guest' }, body: {
+              articleId, duration, mode, strict, clientId,
+              ...(settings.guardCatalog && article ? { articleKey: catalogSnapshotKey(article) } : {}),
+            },
+          });
+          if (challenge.id !== clientId || challenge.target !== attempt.target) throw new Error('练习数据无效');
+          if (!current()) return;
+          attempt.id = challenge.id; attempt.offline = false; attempt.pendingStart = false;
+          if (phaseRef.current !== 'finishing') persist(attempt, true);
+        } catch (error) {
+          if (!current()) return;
+          attempt.pendingStart = false;
+          if (settings.guardCatalog && error instanceof ApiError && (error.status === 409 || error.status === 400)) settings.onCatalogStale?.();
+          setFeedback('在线练习不可用，已转为个人练习。');
+          if (phaseRef.current !== 'finishing') persist(attempt, true);
+        }
+      })();
+      pendingStart.current = { attempt, promise };
+      void promise.finally(() => { if (pendingStart.current?.promise === promise) pendingStart.current = null; });
+    } else if (!custom) setFeedback('在线练习不可用，已转为个人练习。');
+    queueMicrotask(() => { if (isCurrent(attempt, 'running') && liveConfig.current.autoPause && document.visibilityState === 'hidden') void pause(); });
+  }
 
   async function start() {
     if (phaseRef.current !== 'ready' || !validDuration(config.duration) || !config.text) return;
@@ -515,6 +599,8 @@ export function usePractice(config: PracticeConfig, initialDraft: PracticeDraft 
     if (used >= durationLimit(attempt)) { void finish(false); return false; }
     composing.current = false; setRaw(typedRef.current);
     attempt.elapsedMs = used; attempt.startedAt = null; setElapsedMs(used); clearTimer(); setCurrentPhase('pausing'); persist(attempt, true);
+    if (pendingStart.current?.attempt === attempt) await pendingStart.current.promise;
+    if (!isCurrent(attempt, 'pausing')) return false;
     return pauseOnline(attempt, 'pausing', false);
   }
 
@@ -597,7 +683,7 @@ export function usePractice(config: PracticeConfig, initialDraft: PracticeDraft 
         if (clearDraft(draft, ownerToken.current)) removeWorkspaceDraft(draft);
       }
     }
-    attemptRef.current = null; continuationRef.current = null; parked.current = false; typedRef.current = ''; composing.current = false;
+    attemptRef.current = null; continuationRef.current = null; parked.current = false; typedRef.current = ''; composing.current = false; pendingSuspicious.current = false;
     targetCharacters.current = null; committedCharacters.current = null;
     setRaw(''); setTyped(''); setTarget(nextTarget); setElapsedMs(0); setBackspaces(0); setResult(null); setFeedback(''); setRestored(false); setCurrentPhase('ready');
   }
@@ -639,6 +725,7 @@ export function usePractice(config: PracticeConfig, initialDraft: PracticeDraft 
     if (next.length === expected.length && !blocked) void finish(true);
   }
   function onChange(event: ChangeEvent<HTMLTextAreaElement>, prefix = '') {
+    if (phaseRef.current === 'ready' && event.target.value) startFromInput();
     if (phaseRef.current !== 'running') return;
     const input = event.nativeEvent as InputEvent;
     if (attemptRef.current && elapsedTime(attemptRef.current) >= durationLimit(attemptRef.current)) { void finish(false); return; }
@@ -647,14 +734,16 @@ export function usePractice(config: PracticeConfig, initialDraft: PracticeDraft 
     if (composing.current || input.isComposing) setRaw(value);
     else commit(value, input.inputType?.startsWith('delete'));
   }
-  function onCompositionStart() { if (phaseRef.current === 'running') composing.current = true; }
+  function onCompositionStart() { if (phaseRef.current === 'running' || phaseRef.current === 'ready') composing.current = true; }
   function onCompositionEnd(event: CompositionEvent<HTMLTextAreaElement>, prefix = '') {
     const wasComposing = composing.current;
     composing.current = false;
     if (!wasComposing) { setRaw(typedRef.current); return; }
+    if (phaseRef.current === 'ready' && event.currentTarget.value) startFromInput();
     if (phaseRef.current === 'running') commit(prefix + event.currentTarget.value);
   }
   function markSuspicious() {
+    if (phaseRef.current === 'ready') pendingSuspicious.current = true;
     if (attemptRef.current && phaseRef.current === 'running') {
       attemptRef.current.suspicious = true;
       persist(attemptRef.current);
@@ -666,6 +755,10 @@ export function usePractice(config: PracticeConfig, initialDraft: PracticeDraft 
     recordBackspace();
     commit(characters.slice(0, -1).join(''), true);
   }
+  function updateTyped(value: string) {
+    if (phaseRef.current === 'ready' && value) startFromInput();
+    commit(value);
+  }
 
   const attempt = attemptRef.current;
   const mode = (attempt ? attempt.mode : config.mode) ?? 'timed';
@@ -673,5 +766,5 @@ export function usePractice(config: PracticeConfig, initialDraft: PracticeDraft 
   const duration = attempt?.duration ?? config.duration;
   const offset = attempt?.offset ?? 0;
   const draftId = attempt ? practiceDraftId(attempt.recordId) : undefined;
-  return { phase, target, raw, typed, elapsedMs, backspaces, feedback, result, restored, mode, strict, duration, offset, draftId, textareaRef, start, pause, resume, reset, finish, park, loadSaved, loadLegacy, updateTyped: commit, deletePreviousCharacter, onChange, onKeyDown, onCompositionStart, onCompositionEnd, markSuspicious };
+  return { phase, target, raw, typed, elapsedMs, backspaces, feedback, result, restored, mode, strict, duration, offset, draftId, textareaRef, start, pause, resume, reset, finish, park, loadSaved, loadLegacy, updateTyped, deletePreviousCharacter, onChange, onKeyDown, onCompositionStart, onCompositionEnd, markSuspicious };
 }

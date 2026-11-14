@@ -29,7 +29,6 @@ async function register(page: Page, username: string) {
 
 test('uploads a real raster, adjusts it, preserves typing and restores default after reload', async ({ page }) => {
   await page.goto('/');
-  await page.getByRole('button', { name: '开始练习' }).click();
   await page.getByRole('textbox', { name: '当前行输入' }).fill('我与父亲');
   const dialog = await editor(page);
   await upload(page);

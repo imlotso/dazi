@@ -18,12 +18,16 @@ beforeEach(() => {
 afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
 async function startCustom(text: string) {
-  const start = await screen.findByRole('button', { name: '开始练习' }) as HTMLButtonElement;
-  await waitFor(() => expect(start.disabled).toBe(false));
+  const input = await screen.findByRole('textbox', { name: '当前行输入' }) as HTMLTextAreaElement;
+  await waitFor(() => expect(input.disabled).toBe(false));
   fireEvent.click(screen.getByRole('button', { name: '自定义文字' }));
   fireEvent.change(screen.getByRole('textbox', { name: '自定义文章内容' }), { target: { value: text } });
   fireEvent.click(screen.getByRole('button', { name: '使用这段文字' }));
-  fireEvent.click(start);
+  const field = screen.getByRole('textbox', { name: '当前行输入' });
+  fireEvent.compositionStart(field);
+  fireEvent.change(field, { target: { value: 'x' } });
+  fireEvent.change(field, { target: { value: '' } });
+  fireEvent.compositionEnd(field, { data: '' });
   await screen.findByRole('button', { name: '暂停练习' });
 }
 
@@ -42,7 +46,7 @@ it.each(['adjust', 'reset'])('keeps the edited background theme fixed when remot
   vi.stubGlobal('fetch', vi.fn(async (url: string) => response(url === '/api/me' ? { user: { id: owner, username: '背景账号' } } : { items: [], serverTime: Date.now() })));
   render(<App />);
   await screen.findByRole('button', { name: /背景账号/ });
-  await waitFor(() => expect((screen.getByRole('button', { name: '开始练习' }) as HTMLButtonElement).disabled).toBe(false));
+  await waitFor(() => expect((screen.getByRole('textbox', { name: '当前行输入' }) as HTMLTextAreaElement).disabled).toBe(false));
   more('设置'); fireEvent.click(screen.getByRole('button', { name: '背景图' }));
   if (action === 'reset') fireEvent.click(screen.getByRole('button', { name: '恢复默认' }));
   else fireEvent.change(screen.getByRole('slider', { name: '模糊' }), { target: { value: 4 } });
@@ -73,7 +77,7 @@ it('parks active text across navigation and resumes its exact draft', async () =
 
 it('uses reader settings and exits focus mode with Escape', async () => {
   render(<App />);
-  await screen.findByRole('button', { name: '开始练习' });
+  await screen.findByRole('textbox', { name: '当前行输入' });
   more('设置');
   const dialog = screen.getByRole('dialog', { name: '练习设置' });
   fireEvent.change(within(dialog).getByRole('slider', { name: '字号' }), { target: { value: '24' } });
@@ -123,7 +127,7 @@ it('opens a history continuation with only the new round contributing to live sp
     language: 'zh', difficulty: 'beginner', duration: 300, speed: 45, accuracy: 100, finishedAt: Date.now(),
   });
   render(<App />);
-  await screen.findByRole('button', { name: '开始练习' });
+  await screen.findByRole('textbox', { name: '当前行输入' });
   fireEvent.click(screen.getByRole('button', { name: '我的记录' }));
   fireEvent.click(await screen.findByRole('button', { name: '《旧信》详情' }));
   fireEvent.click(within(screen.getByRole('dialog', { name: '练习详情' })).getByRole('button', { name: '继续练习' }));
@@ -136,18 +140,19 @@ it('keeps the local practice snapshot and uses the authoritative moderation stat
   const record = {
     recordId: 'attempt', ownerId: 'account', article: { id: 'old', title: '留存的信', text: '甲乙', custom: false, language: 'zh' as const, difficulty: 'beginner' as const },
     typed: '甲甲', mistakes: [{ position: 1, expected: '乙', actual: '甲' }], language: 'zh' as const,
-    difficulty: 'beginner' as const, duration: 300, speed: 15, accuracy: 50, finishedAt: Date.now(), status: 'review',
+    difficulty: 'beginner' as const, duration: 300, speed: 15, accuracy: 50, finishedAt: Date.now(), status: 'review', localOnly: true,
   };
   await putWorkspaceValue('account', 'record', record.recordId, record);
   vi.stubGlobal('fetch', vi.fn(async (url: string) => {
     if (url === '/api/me') return response({ user: { id: 'account', username: '本账号' } });
-    if (url === '/api/history') return response({ entries: [{ ...record, status: 'rejected', article: undefined, typed: undefined, mistakes: undefined }] });
+    if (url === '/api/history') return response({ entries: [{ ...record, status: 'rejected', article: undefined, typed: undefined, mistakes: undefined, localOnly: undefined }] });
     return response({ items: [], serverTime: Date.now() });
   }));
   render(<App />);
   await screen.findByRole('button', { name: /本账号/ });
   fireEvent.click(screen.getByRole('button', { name: '我的记录' }));
   await screen.findByText('复核未通过');
+  expect(screen.queryByText('个人练习')).toBeNull();
   fireEvent.click(await screen.findByRole('button', { name: '《留存的信》详情' }));
   const details = screen.getByRole('dialog', { name: '练习详情' });
   expect(within(details).getByText('复核未通过')).toBeTruthy();
@@ -167,7 +172,7 @@ it('can explicitly resume a local account draft while the sync endpoint is unava
   }));
   render(<App />);
   await screen.findByRole('button', { name: /离线账号/ });
-  await waitFor(() => expect((screen.getByRole('button', { name: '开始练习' }) as HTMLButtonElement).disabled).toBe(false));
+  await waitFor(() => expect((screen.getByRole('textbox', { name: '当前行输入' }) as HTMLTextAreaElement).disabled).toBe(false));
   expect(screen.queryByRole('heading', { name: '离线草稿' })).toBeNull();
   more('草稿箱');
   fireEvent.click(await screen.findByRole('button', { name: '继续《离线草稿》' }));
@@ -211,7 +216,7 @@ it('keeps independent rounds of the same article accessible after another round 
     language: 'zh', difficulty: 'beginner', duration: 300, speed: 60, accuracy: 100, finishedAt: savedAt + 2000,
   });
   render(<App />);
-  await waitFor(() => expect((screen.getByRole('button', { name: '开始练习' }) as HTMLButtonElement).disabled).toBe(false));
+  await waitFor(() => expect((screen.getByRole('textbox', { name: '当前行输入' }) as HTMLTextAreaElement).disabled).toBe(false));
   more('草稿箱');
   const actions = await screen.findAllByRole('button', { name: '继续《同一封信》' });
   expect(actions).toHaveLength(2);

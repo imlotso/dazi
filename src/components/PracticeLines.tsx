@@ -7,18 +7,18 @@ import { splitCharacters } from '../lib/scoring';
 
 type Practice = ReturnType<typeof usePractice>;
 type Reader = Pick<ReaderSettings, 'fontSize' | 'lineHeight' | 'visibleLines'>;
-type Props = { practice: Practice; title: string; reader?: Reader };
+type Props = { practice: Practice; title: string; reader?: Reader; canStart?: boolean; onStart?: () => void };
 const fallbackMeasure = (character: string): number => /^[\x00-\x7f]$/.test(character) ? 10 : 18;
-const visibleText = (text: string) => text.replaceAll('\n', '↵').replaceAll(' ', '·');
+const visibleText = (text: string) => text.replaceAll('\n', '↵');
 type RowProps = {
   line: PracticeLine; index: number; active: boolean; phase: PracticePhase;
   typedValue: string; value: string; composing: boolean; blocked: boolean; inputStart: number;
   controller: RefObject<Practice>; currentIndex: RefObject<number>;
-  activeRow: RefObject<HTMLDivElement | null>;
+  activeRow: RefObject<HTMLDivElement | null>; canStart: boolean; onStart?: () => void;
   setComposing: (value: boolean) => void;
 };
 
-const PracticeRow = memo(function PracticeRow({ line, index, active, phase, typedValue, value, composing, blocked, inputStart, controller, currentIndex, activeRow, setComposing }: RowProps) {
+const PracticeRow = memo(function PracticeRow({ line, index, active, phase, typedValue, value, composing, blocked, inputStart, controller, currentIndex, activeRow, setComposing, canStart, onStart }: RowProps) {
   const actual = useMemo(() => splitCharacters(typedValue), [typedValue]);
   const completed = !blocked && actual.length === line.characters.length;
   const rowErrors = actual.filter((character, offset) => character !== line.characters[offset]).length;
@@ -46,18 +46,18 @@ const PracticeRow = memo(function PracticeRow({ line, index, active, phase, type
       <div className="line-source" data-testid={`practice-source-${index}`} data-text={line.text} aria-label={line.text}>
         {!active && (actual.length === 0 || (completed && rowErrors === 0)) ? <span className={completed ? 'char-correct' : undefined}>{visibleText(line.text)}</span> : line.characters.map((character, offset) => {
           const state = offset < actual.length ? (actual[offset] === character ? 'char-correct' : 'char-wrong') : offset === actual.length && phase === 'running' ? 'char-current' : '';
-          return <span key={offset} className={state} title={character === '\n' ? '换行' : character === ' ' ? '空格' : character === '\t' ? '制表符' : undefined}>{character === '\n' ? '↵' : character === ' ' ? <span className="space-character">·</span> : character}</span>;
+          return <span key={offset} className={state} title={character === '\n' ? '换行' : character === ' ' ? '空格' : character === '\t' ? '制表符' : undefined}>{character === '\n' ? '↵' : character}</span>;
         })}
       </div>
       <textarea
         ref={active ? controller.current.textareaRef : undefined}
         id={active ? 'typing-input' : undefined}
         aria-label={active ? '当前行输入' : `第 ${index + 1} 行输入`}
-        value={value} disabled={!active || phase !== 'running'}
+        value={value} disabled={!active || (phase !== 'running' && !(phase === 'ready' && canStart))}
         rows={1} wrap="off" spellCheck={false} autoComplete="off" autoCapitalize="off" autoCorrect="off"
-        onChange={(event) => { if (index === currentIndex.current) controller.current.onChange(event, prefix()); }}
-        onCompositionStart={() => { if (index === currentIndex.current && phase === 'running') { setComposing(true); controller.current.onCompositionStart(); } }}
-        onCompositionEnd={(event) => { if (index === currentIndex.current) { controller.current.onCompositionEnd(event, prefix()); setComposing(false); } }}
+        onChange={(event) => { if (index === currentIndex.current) { if (phase === 'ready' && event.target.value) onStart?.(); controller.current.onChange(event, prefix()); } }}
+        onCompositionStart={() => { if (index === currentIndex.current && (phase === 'running' || phase === 'ready')) { setComposing(true); controller.current.onCompositionStart(); } }}
+        onCompositionEnd={(event) => { if (index === currentIndex.current) { if (phase === 'ready' && event.currentTarget.value) onStart?.(); controller.current.onCompositionEnd(event, prefix()); setComposing(false); } }}
         onKeyDown={(event) => {
           const practice = controller.current;
           if (composing || event.nativeEvent.isComposing || event.keyCode === 229) return;
@@ -71,6 +71,7 @@ const PracticeRow = memo(function PracticeRow({ line, index, active, phase, type
             const position = inputStart - line.start + splitCharacters(field.value.slice(0, field.selectionStart)).length;
             if (line.characters[position] === '\t') {
               event.preventDefault();
+              if (phase === 'ready') onStart?.();
               practice.updateTyped(prefix() + field.value.slice(0, field.selectionStart) + '\t' + field.value.slice(field.selectionEnd));
             }
           }
@@ -84,7 +85,7 @@ const PracticeRow = memo(function PracticeRow({ line, index, active, phase, type
   </div>;
 });
 
-export const PracticeLines = memo(function PracticeLines({ practice, title, reader }: Props) {
+export const PracticeLines = memo(function PracticeLines({ practice, title, reader, canStart = true, onStart }: Props) {
   const { target, typed, raw, phase, strict, offset } = practice;
   const controller = useRef(practice);
   controller.current = practice;
@@ -104,7 +105,7 @@ export const PracticeLines = memo(function PracticeLines({ practice, title, read
   currentIndex.current = activeIndex;
 
   useLayoutEffect(() => {
-    if (composing && phase === 'running') return;
+    if (composing && (phase === 'running' || phase === 'ready')) return;
     const container = viewport.current;
     if (!container) return;
     const measure = () => {
@@ -129,7 +130,7 @@ export const PracticeLines = memo(function PracticeLines({ practice, title, read
   }, [target, composing, phase, reader?.fontSize, reader?.lineHeight, reader?.visibleLines]);
 
   useEffect(() => {
-    if (phase !== 'running') setComposing(false);
+    if (phase !== 'running' && phase !== 'ready') setComposing(false);
     if (phase === 'ready') {
       if (viewport.current) viewport.current.scrollTop = 0;
       return;
@@ -180,7 +181,7 @@ export const PracticeLines = memo(function PracticeLines({ practice, title, read
         return <PracticeRow key={line.start} line={line} index={index} active={active} phase={phase}
           inputStart={inputStart} typedValue={typedValue} value={active ? rawCharacters.slice(inputStart).join('') : typedCharacters.slice(inputStart, line.end).join('')}
           blocked={active && wrong >= 0} composing={active && composing} controller={controller} currentIndex={currentIndex} activeRow={activeRow}
-          setComposing={setComposing} />;
+          setComposing={setComposing} canStart={canStart} onStart={onStart} />;
       })}
     </div>
   </>;
@@ -189,5 +190,5 @@ export const PracticeLines = memo(function PracticeLines({ practice, title, read
 }, (before, after) => before.title === after.title &&
   before.practice.target === after.practice.target && before.practice.typed === after.practice.typed &&
   before.practice.raw === after.practice.raw && before.practice.phase === after.practice.phase &&
-  before.practice.strict === after.practice.strict && before.practice.offset === after.practice.offset &&
+  before.practice.strict === after.practice.strict && before.practice.offset === after.practice.offset && before.canStart === after.canStart &&
   before.reader?.fontSize === after.reader?.fontSize && before.reader?.lineHeight === after.reader?.lineHeight && before.reader?.visibleLines === after.reader?.visibleLines);

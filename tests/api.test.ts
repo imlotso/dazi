@@ -79,6 +79,18 @@ describe('typing API', () => {
     }
   });
 
+  it('accepts a client-generated UUID without allowing duplicate challenge identities', async () => {
+    const clientId = '7b224e39-1a5f-43a9-89aa-23bcdfe8142b';
+    const payload = { articleId: 'zh-beginner-1', duration: 60, clientId };
+    const first = await app.inject({ method: 'POST', url: '/api/tests/start', payload });
+    expect(first.statusCode).toBe(200);
+    expect(first.json().id).toBe(clientId);
+    const duplicate = await app.inject({ method: 'POST', url: '/api/tests/start', payload });
+    expect(duplicate.statusCode).toBe(409);
+    expect((await app.inject({ method: 'POST', url: '/api/tests/start', payload: { ...payload, clientId: 'unsafe-id' } })).statusCode).toBe(400);
+    expect((await app.inject({ method: 'GET', url: `/api/tests/${clientId}` })).statusCode).toBe(404);
+  });
+
   it('freezes persisted active time while paused and excludes the gap from speed and review', async () => {
     await app.close();
     temporary = mkdtempSync(join(tmpdir(), 'typing-pause-'));
