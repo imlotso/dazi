@@ -57,6 +57,8 @@ export const draftAwaitingStart = (draft: PracticeDraft) => !!draft.pendingStart
 const validDuration = (seconds: number) => Number.isInteger(seconds) && seconds >= 60 && seconds <= 3600 && seconds % 60 === 0;
 const durationLimit = (round: Pick<RoundConfig, 'mode' | 'duration'>) => round.mode === 'article' ? articleLimitMs : round.duration * 1000;
 const validAttemptId = (id: string) => /^[\w-]{1,80}$/.test(id);
+const guestPracticeDisabledMessage = '游客在线练习已关闭，已转为本地练习。';
+const isGuestPracticeDisabled = (error: unknown) => error instanceof ApiError && error.code === 'GUEST_ONLINE_PRACTICE_DISABLED';
 const recoveryUuid = (id: string | undefined): id is string => !!id && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(id);
 function recoverableId(attempt: Attempt) {
   if (attempt.custom || attempt.personalOnly || (attempt.offset ?? 0) > 0) return undefined;
@@ -460,7 +462,17 @@ export function usePractice(config: PracticeConfig, initialDraft: PracticeDraft 
       setFeedback('');
       return state;
     } catch (error) {
-      if (current() && !handleRecoveryConflict(attempt, error)) { attempt.offline = true; setFeedback(error instanceof ApiError && error.status === 404 ? '文章或账号状态已变化，无法恢复上榜。' : '网络暂不可用，进度暂存本机。'); }
+      if (!current()) return undefined;
+      if (isGuestPracticeDisabled(error)) {
+        attempt.personalOnly = true;
+        attempt.offline = true;
+        attempt.recoveryRequestId = undefined;
+        setFeedback(guestPracticeDisabledMessage);
+        if (expectedPhase === 'paused') persist(attempt, true);
+      } else if (!handleRecoveryConflict(attempt, error)) {
+        attempt.offline = true;
+        setFeedback(error instanceof ApiError && error.status === 404 ? '文章或账号状态已变化，无法恢复上榜。' : '网络暂不可用，进度暂存本机。');
+      }
       return undefined;
     }
   }
@@ -640,7 +652,7 @@ export function usePractice(config: PracticeConfig, initialDraft: PracticeDraft 
     let recoveringPaused = false;
     const retryPaused = () => {
       const attempt = attemptRef.current;
-      if (attempt && !parked.current && phaseRef.current === 'paused' && attempt.offline && attempt.recoveryRequestId && !recoveringPaused && document.visibilityState !== 'hidden') {
+      if (attempt && !parked.current && phaseRef.current === 'paused' && attempt.offline && attempt.recoveryRequestId && recoverableId(attempt) && !recoveringPaused && document.visibilityState !== 'hidden') {
         recoveringPaused = true;
         void recoverOnline(attempt, 'paused').then((state) => {
           if (!isCurrent(attempt, 'paused')) return;
@@ -755,7 +767,10 @@ export function usePractice(config: PracticeConfig, initialDraft: PracticeDraft 
           if (!current()) return;
           attempt.pendingStart = false;
           if (settings.guardCatalog && error instanceof ApiError && (error.status === 409 || error.status === 400)) settings.onCatalogStale?.();
-          setFeedback('网络暂不可用，进度暂存本机。');
+          if (isGuestPracticeDisabled(error)) {
+            attempt.personalOnly = true;
+            setFeedback(guestPracticeDisabledMessage);
+          } else setFeedback('网络暂不可用，进度暂存本机。');
           if (phaseRef.current !== 'finishing') persist(attempt, true);
         }
       })();
@@ -775,6 +790,7 @@ export function usePractice(config: PracticeConfig, initialDraft: PracticeDraft 
     let testTarget = config.text;
     let id: string | undefined;
     let offline = custom;
+    let personalOnly = false;
     if (!custom) {
       try {
         const challenge = await api<{ id: string; target: string }>('/api/tests/start', {
@@ -788,14 +804,15 @@ export function usePractice(config: PracticeConfig, initialDraft: PracticeDraft 
       } catch (error) {
         if (config.guardCatalog && error instanceof ApiError && (error.status === 409 || error.status === 400)) config.onCatalogStale?.();
         offline = true;
+        personalOnly = isGuestPracticeDisabled(error);
       }
     }
     if (!current()) {
       if (mounted.current && startRequest.current === request) setCurrentPhase('ready');
       return;
     }
-    if (offline && !custom) setFeedback('在线练习不可用，已转为个人练习。');
-    const attempt: Attempt = { articleId, title, language, difficulty, duration, custom, ownerId, article, mode, strict, text: testTarget, id, recordId: id || uniqueId(), revision: 0, target: testTarget, offline, elapsedMs: 0, startedAt: performance.now(), suspicious: false, backspaces: 0, nextCheckpointMs: 5000, offset: 0, mistakes: [] };
+    if (offline && !custom) setFeedback(personalOnly ? guestPracticeDisabledMessage : '在线练习不可用，已转为个人练习。');
+    const attempt: Attempt = { articleId, title, language, difficulty, duration, custom, ownerId, article, mode, strict, text: testTarget, id, recordId: id || uniqueId(), revision: 0, target: testTarget, offline, personalOnly, elapsedMs: 0, startedAt: performance.now(), suspicious: false, backspaces: 0, nextCheckpointMs: 5000, offset: 0, mistakes: [] };
     parked.current = false; lastBackspaceKey.current = -Infinity;
     attemptRef.current = attempt; setTarget(testTarget); setCurrentPhase('running'); persist(attempt, true); beginClock();
     if (liveConfig.current.autoPause && document.visibilityState === 'hidden') void pause();

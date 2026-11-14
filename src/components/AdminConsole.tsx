@@ -3,6 +3,8 @@ import { ShieldCheck } from '@phosphor-icons/react/ShieldCheck';
 import { ArticlesPanel } from './admin/ArticlesPanel';
 import { ScoresPanel } from './admin/ScoresPanel';
 import { UsersPanel } from './admin/UsersPanel';
+import { SmtpPanel } from './admin/SmtpPanel';
+import { SiteSettingsPanel } from './admin/SiteSettingsPanel';
 import {
   AuditRows, LoadState, Metrics, Pagination, QueryField, SelectField, targets, useAdminList, useAdminResource,
   type AdminProps, type Audit,
@@ -10,7 +12,7 @@ import {
 import '../admin.css';
 
 const tabs = [
-  ['overview', '概览'], ['users', '用户'], ['articles', '文章'], ['scores', '成绩'], ['audit', '操作日志'],
+  ['overview', '概览'], ['users', '用户'], ['articles', '文章'], ['scores', '成绩'], ['settings', '站点设置'], ['mail', '邮件'], ['audit', '操作日志'],
 ] as const;
 type Tab = typeof tabs[number][0];
 const labels = {
@@ -55,6 +57,8 @@ export function AdminConsole({ ownerId, onCatalogChange }: AdminProps & { onCata
       {tab === 'users' && <UsersPanel ownerId={ownerId} />}
       {tab === 'articles' && <ArticlesPanel ownerId={ownerId} onCatalogChange={onCatalogChange} />}
       {tab === 'scores' && <ScoresPanel ownerId={ownerId} />}
+      {tab === 'settings' && <SiteSettingsPanel ownerId={ownerId} />}
+      {tab === 'mail' && <SmtpPanel ownerId={ownerId} />}
       {tab === 'audit' && <AuditPanel ownerId={ownerId} />}
     </div>
   </section>;

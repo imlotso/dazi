@@ -4,7 +4,7 @@ import { z } from 'zod';
 import { difficulties, type Difficulty, type Language } from '../src/data/articles';
 
 export type AdminActor = { id: string; username: string; authVersion: number };
-type TargetType = 'user' | 'article' | 'score';
+type TargetType = 'user' | 'article' | 'score' | 'setting';
 export class AdminAccessError extends Error {
   readonly statusCode = 403;
   constructor() { super('管理权限已变更'); }
@@ -34,7 +34,7 @@ const userQuery = pagination.extend({ role: roleField.optional(), status: status
 const scoreQuery = pagination.extend({
   status: scoreStatus.optional(), language: z.enum(['zh', 'en']).optional(), difficulty: z.enum(difficulties).optional(),
 });
-const auditQuery = pagination.extend({ targetType: z.enum(['user', 'article', 'score']).optional() });
+const auditQuery = pagination.extend({ targetType: z.enum(['user', 'article', 'score', 'setting']).optional() });
 const accountStatus = z.strictObject({ status: statusField, reason: reasonField });
 const accountRole = z.strictObject({ role: roleField, reason: reasonField });
 
@@ -63,12 +63,21 @@ export function migrateAdministration(db: Database.Database, adminEmail: string)
         db.prepare('DELETE FROM email_codes WHERE email=?').run(adminEmail);
       }
     }
+    const oldAudit = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='admin_audit'").get() as { sql: string } | undefined;
+    const migrateAuditTargets = oldAudit && !oldAudit.sql.includes("'setting'");
+    if (migrateAuditTargets) db.exec('ALTER TABLE admin_audit RENAME TO admin_audit_legacy');
     db.exec(`
       CREATE TABLE IF NOT EXISTS admin_audit (
         id INTEGER PRIMARY KEY AUTOINCREMENT, actor_id TEXT NOT NULL, actor_name TEXT NOT NULL,
-        action TEXT NOT NULL, target_type TEXT NOT NULL CHECK (target_type IN ('user','article','score')),
+        action TEXT NOT NULL, target_type TEXT NOT NULL CHECK (target_type IN ('user','article','score','setting')),
         target_id TEXT NOT NULL, target_label TEXT NOT NULL, reason TEXT, created_at INTEGER NOT NULL
       );
+    `);
+    if (migrateAuditTargets) {
+      db.exec(`INSERT INTO admin_audit SELECT * FROM admin_audit_legacy;
+        DROP TABLE admin_audit_legacy;`);
+    }
+    db.exec(`
       CREATE INDEX IF NOT EXISTS admin_audit_target ON admin_audit(target_type,id DESC);
       CREATE INDEX IF NOT EXISTS sessions_user ON sessions(user_id);
       CREATE INDEX IF NOT EXISTS challenges_admin_scores ON challenges(finished_at DESC,id) WHERE published=1;
