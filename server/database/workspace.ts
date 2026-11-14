@@ -1,8 +1,8 @@
 import { createHash } from 'node:crypto';
-import type { WorkspaceItem } from '../../src/lib/models';
-import { newerWorkspaceItems } from '../../src/lib/workspace';
-import { WorkspaceChangedError, WorkspaceCursorError, WorkspaceLimitError, WorkspacePageSizeError } from '../workspace';
-import type { AsyncDatabase } from './types';
+import type { WorkspaceItem } from '../../src/lib/models.js';
+import { newerWorkspaceItems } from '../../src/lib/workspace.js';
+import { WorkspaceChangedError, WorkspaceCursorError, WorkspaceLimitError, WorkspacePageSizeError } from '../workspace.js';
+import type { AsyncDatabase } from './types.js';
 
 const maxWorkspaceItems = 2000;
 const maxWorkspaceBytes = 32 * 1024 * 1024;
@@ -60,10 +60,13 @@ export async function createAsyncWorkspaceStore(db: AsyncDatabase) {
     if (changed) await bumpRevision.run(owner);
   });
   const get = async (owner: string) => (await getRows.all(owner) as Stored[]).map(decode);
-  const pagedSnapshot = db.transaction(async (owner: string, cursor: string | undefined, known: string | undefined) => {
+  const backgroundState = async (owner: string, known: string | undefined) => {
     const backgrounds = (await getBackgrounds.all(owner) as Stored[]).map(decode);
     const backgroundsVersion = createHash('sha256').update(owner).update(JSON.stringify(backgrounds)).digest('hex');
-    const backgroundsUnchanged = known === backgroundsVersion;
+    return { backgroundsVersion, backgroundsUnchanged: known === backgroundsVersion };
+  };
+  const pagedSnapshot = db.transaction(async (owner: string, cursor: string | undefined, known: string | undefined) => {
+    const { backgroundsVersion, backgroundsUnchanged } = await backgroundState(owner, known);
     const revision = (await readRevision.get(owner) as { revision: number } | undefined)?.revision ?? 0;
     let kind = '';
     let id = '';
@@ -98,5 +101,5 @@ export async function createAsyncWorkspaceStore(db: AsyncDatabase) {
       ? Buffer.from(JSON.stringify([revision, last.kind, last.id])).toString('base64url') : null;
     return { items, nextCursor, backgroundsVersion, backgroundsUnchanged };
   });
-  return { merge, get, pagedSnapshot };
+  return { merge, get, pagedSnapshot, backgroundState };
 }

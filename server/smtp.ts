@@ -1,11 +1,11 @@
 import { createCipheriv, createDecipheriv, createHmac, randomBytes } from 'node:crypto';
 import { Resolver } from 'node:dns/promises';
 import { BlockList, isIP } from 'node:net';
-import type Database from 'better-sqlite3';
+import type { AsyncDatabase } from './database/types.js';
 import type { FastifyInstance, FastifyRequest } from 'fastify';
 import nodemailer from 'nodemailer';
 import { z } from 'zod';
-import type { AdminActor, createAdminAudit } from './admin';
+import type { AdminActor, createAdminAudit } from './admin.js';
 
 type SmtpSource = 'admin' | 'deployment';
 export type SmtpConfiguration = {
@@ -106,12 +106,12 @@ function verifyFailure(error: unknown) {
   return 'SMTP 验证失败，请检查主机、端口和加密方式';
 }
 
-export function createSmtpSettings(db: Database.Database, {
+export async function createSmtpSettings(db: AsyncDatabase, {
   codeSecret, deployment, fallbackMailer, delivery = defaultDelivery, now,
 }: {
   codeSecret?: string; deployment?: SmtpConfiguration; fallbackMailer?: Mailer; delivery?: SmtpDelivery; now: () => number;
 }) {
-  db.exec(`CREATE TABLE IF NOT EXISTS smtp_settings (
+  if (db.dialect === 'sqlite') await db.exec(`CREATE TABLE IF NOT EXISTS smtp_settings (
     id INTEGER PRIMARY KEY CHECK (id = 1), revision INTEGER NOT NULL, config TEXT, updated_at INTEGER NOT NULL
   );`);
   const select = db.prepare('SELECT revision,config,updated_at AS updatedAt FROM smtp_settings WHERE id=1');
@@ -120,8 +120,8 @@ export function createSmtpSettings(db: Database.Database, {
   const key = codeSecret && codeSecret.length >= 32
     ? createHmac('sha256', codeSecret).update('dazi.smtp.credentials.v1').digest() : undefined;
 
-  function stored() {
-    const row = select.get() as { revision: number; config: string | null; updatedAt: number } | undefined;
+  async function stored() {
+    const row = (await select.get()) as { revision: number; config: string | null; updatedAt: number } | undefined;
     return { revision: row?.revision ?? 0, override: row?.config ? JSON.parse(row.config) as StoredSmtp : undefined, updatedAt: row?.updatedAt ?? null };
   }
 
@@ -155,8 +155,8 @@ export function createSmtpSettings(db: Database.Database, {
     return { ...config, password: decrypt(secret) };
   }
 
-  function describe() {
-    const { override, ...state } = stored();
+  async function describe() {
+    const { override, ...state } = await stored();
     const config = override ?? deployment;
     const source = override ? 'admin' : deployment ? 'deployment' : fallbackMailer ? 'development' : 'unconfigured';
     const protectedPassword = override?.secret ?? null;
@@ -185,27 +185,27 @@ export function createSmtpSettings(db: Database.Database, {
     return { ...settings, username, password: decrypt(existing.secret) };
   }
 
-  function checked(input: RevisionInput) {
-    const state = stored();
+  async function checked(input: RevisionInput) {
+    const state = await stored();
     if (state.revision !== input.revision) throw new SmtpError('邮件配置已变更，请刷新后重试', 409);
     return state;
   }
 
-  function register(app: FastifyInstance, audit: ReturnType<typeof createAdminAudit>, assertCurrentAdmin: (request: FastifyRequest) => void) {
-    const write = db.transaction((request: FastifyRequest, input: z.infer<typeof saveInput> | RevisionInput) => {
-      assertCurrentAdmin(request);
+  function register(app: FastifyInstance, audit: ReturnType<typeof createAdminAudit>, assertCurrentAdmin: (request: FastifyRequest) => Promise<void>) {
+    const write = db.transaction(async (request: FastifyRequest, input: z.infer<typeof saveInput> | RevisionInput) => {
+      await assertCurrentAdmin(request);
       const actor: AdminActor = request.admin;
-      const { override, revision } = checked(input);
+      const { override, revision } = await checked(input);
       if ('host' in input) {
         cryptKey();
         const { revision: _, ...draft } = input;
         const { password, ...config } = resolveDraft(draft, override);
-        upsert.run(revision + 1, JSON.stringify({ ...config, secret: encrypt(password) }), now());
-        audit(actor, 'smtp.update', 'setting', 'smtp', '邮件配置', null);
+        (await upsert.run(revision + 1, JSON.stringify({ ...config, secret: encrypt(password) }), now()));
+        await audit(actor, 'smtp.update', 'setting', 'smtp', '邮件配置', null);
       } else {
         if (!override) throw new SmtpError('当前使用部署默认配置', 409);
-        upsert.run(revision + 1, null, now());
-        audit(actor, 'smtp.reset', 'setting', 'smtp', '邮件配置', null);
+        (await upsert.run(revision + 1, null, now()));
+        await audit(actor, 'smtp.reset', 'setting', 'smtp', '邮件配置', null);
       }
       return describe();
     });
@@ -215,11 +215,11 @@ export function createSmtpSettings(db: Database.Database, {
       const parsed = saveInput.safeParse(request.body);
       if (!parsed.success) return reply.code(400).send({ error: '请检查 SMTP 主机、端口和发件人邮箱' });
       try {
-        const { override } = checked(parsed.data);
+        const { override } = await checked(parsed.data);
         cryptKey();
         const { host } = resolveDraft(parsed.data, override);
         await resolvePublicSmtpHost(host);
-        return write.immediate(request, parsed.data);
+        return await write.immediate(request, parsed.data);
       } catch (error) {
         if (error instanceof SmtpError) return reply.code(error.status).send({ error: error.message });
         throw error;
@@ -228,7 +228,7 @@ export function createSmtpSettings(db: Database.Database, {
     app.post('/smtp/reset', async (request, reply) => {
       const parsed = resetInput.safeParse(request.body);
       if (!parsed.success) return reply.code(400).send({ error: '邮件配置版本无效' });
-      try { return write.immediate(request, parsed.data); }
+      try { return await write.immediate(request, parsed.data); }
       catch (error) {
         if (error instanceof SmtpError) return reply.code(error.status).send({ error: error.message });
         throw error;
@@ -241,7 +241,7 @@ export function createSmtpSettings(db: Database.Database, {
       let config: SmtpConfiguration | undefined;
       let source: SmtpSource;
       try {
-        const { override } = checked(parsed.data);
+        const { override } = await checked(parsed.data);
         config = draft ? resolveDraft(draft, override) : override ? restore(override) : deployment;
         source = override || draft ? 'admin' : 'deployment';
       } catch (error) {
@@ -249,19 +249,24 @@ export function createSmtpSettings(db: Database.Database, {
         throw error;
       }
       if (!config) return reply.code(409).send({ error: '请先填写 SMTP 配置' });
-      audit(request.admin, 'smtp.verify', 'setting', 'smtp', '邮件配置', null);
+      await audit(request.admin, 'smtp.verify', 'setting', 'smtp', '邮件配置', null);
       try { await delivery.verify(config, source); }
       catch (error) { return reply.code(502).send({ error: verifyFailure(error) }); }
       return { ok: true };
     });
   }
 
-  function mailer(): Mailer | undefined {
-    const { override } = stored();
+  async function mailer(): Promise<Mailer | undefined> {
+    const { override } = await stored();
     if (override) return { async sendCode(...args) { await delivery.sendCode(restore(override), 'admin', ...args); } };
     if (deployment) return { async sendCode(...args) { await delivery.sendCode(deployment, 'deployment', ...args); } };
     return fallbackMailer;
   }
 
-  return { register, mailer };
+  async function assertStoredSecret() {
+    const { override } = await stored();
+    if (override?.secret) decrypt(override.secret);
+  }
+
+  return { register, mailer, assertStoredSecret };
 }

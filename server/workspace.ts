@@ -1,9 +1,9 @@
 import type Database from 'better-sqlite3';
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
-import { difficulties } from '../src/data/articles';
-import type { WorkspaceItem, WorkspaceKind } from '../src/lib/models';
-import { isBackgroundConfig, type BackgroundConfig } from '../src/lib/background';
+import { difficulties } from '../src/data/articles.js';
+import type { WorkspaceItem, WorkspaceKind } from '../src/lib/models.js';
+import { isBackgroundConfig, type BackgroundConfig } from '../src/lib/background.js';
 
 export const syncBodyLimit = 4 * 1024 * 1024;
 export const recoveryIdPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;

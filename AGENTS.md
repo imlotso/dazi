@@ -24,6 +24,8 @@ Admin entry correction (2026-11-14): use the existing shared login entry and rou
 
 Admin configuration (2026-11-14): provide SMTP configuration and operational site settings in the management interface. Protect stored SMTP credentials, keep them out of responses and audit logs, retain deployment configuration as a fallback, and allow administrators to test the connection without sending mail. Site controls must enforce registration, guest online practice, guest leaderboard submission, and score-review thresholds consistently while preserving existing online progress.
 
+Hosting direction (2026-11-14): support Vercel Node.js Functions with Neon PostgreSQL while preserving the complete local Node/Docker SQLite deployment and existing data. The previous Turso direction is superseded. Keep Preview and production databases and keys separate, and do not change billing, migrate production data, alter DNS, or deploy without the user's authorization. Preserve the original production `CODE_SECRET` when migrating encrypted SMTP settings.
+
 Practice must default to five minutes, accept whole-minute durations from 1 through 60, and finish immediately when the selected article is fully entered. Preserve unfinished progress locally, support pause and resume, handle Chinese IME composition correctly, calculate speed from active time, and display article length, entered characters, errors, and backspace count.
 
 Run the local server yourself and open the preview in the browser available to this environment. Do not give the user server-start instructions when you can run it.

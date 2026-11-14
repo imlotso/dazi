@@ -1,12 +1,12 @@
 import { createHash, randomUUID } from 'node:crypto';
-import type Database from 'better-sqlite3';
+import type { AsyncDatabase } from './database/types.js';
 import type { FastifyInstance, FastifyReply } from 'fastify';
 import { z } from 'zod';
-import { articles, difficulties, type Article, type Difficulty, type Language } from '../src/data/articles';
-import { articleLength } from '../src/lib/analysis';
-import type { AdminActor } from './admin';
+import { articles, difficulties, type Article, type Difficulty, type Language } from '../src/data/articles.js';
+import { articleLength } from '../src/lib/analysis.js';
+import type { AdminActor } from './admin.js';
 
-type Audit = (actor: AdminActor, action: string, targetType: 'article', targetId: string, targetLabel: string, reason: string | null) => void;
+type Audit = (actor: AdminActor, action: string, targetType: 'article', targetId: string, targetLabel: string, reason: string | null) => void | Promise<void>;
 
 const states = ['draft', 'published', 'archived'] as const;
 type Status = typeof states[number];
@@ -69,8 +69,8 @@ function publicArticle({ id, title, author, theme, language, difficulty, text, s
   return { id, title, author, theme, language, difficulty, content: text, source };
 }
 
-export function createCatalogStore(db: Database.Database, now: () => number) {
-  db.exec(`
+export async function createCatalogStore(db: AsyncDatabase, now: () => number) {
+  if (db.dialect === 'sqlite') await db.exec(`
     CREATE TABLE IF NOT EXISTS public_articles (
       id TEXT PRIMARY KEY, title TEXT NOT NULL, author TEXT NOT NULL, theme TEXT NOT NULL,
       language TEXT NOT NULL, difficulty TEXT NOT NULL, text TEXT NOT NULL, source TEXT NOT NULL,
@@ -121,113 +121,113 @@ export function createCatalogStore(db: Database.Database, now: () => number) {
     };
   }
 
-  db.transaction(() => {
-    articles.forEach(({ id, content, ...metadata }, displayOrder) => {
-      if (insert.run({ ...columns({ ...metadata, text: content }), id, status: 'published', displayOrder }).changes) {
-        recordGroup.run(id, metadata.language, metadata.difficulty);
+  if (db.dialect === 'sqlite') await db.transaction(async () => {
+    for (const [displayOrder, { id, content, ...metadata }] of articles.entries()) {
+      if ((await insert.run({ ...columns({ ...metadata, text: content }), id, status: 'published', displayOrder })).changes) {
+        (await recordGroup.run(id, metadata.language, metadata.difficulty));
       }
-    });
+    }
   }).immediate();
 
-  function find(id: string) {
-    const row = byId.get(id) as ArticleRow | undefined;
+  async function find(id: string) {
+    const row = (await byId.get(id)) as ArticleRow | undefined;
     return row && detail(row);
   }
 
-  function current(id: string, expected: number) {
-    const found = find(id);
+  async function current(id: string, expected: number) {
+    const found = await find(id);
     if (!found) throw new CatalogError('文章不存在', 404);
     if (found.revision !== expected) throw new CatalogError('文章已更新，请重新打开', 409);
     return found;
   }
 
-  function checkPublication(id: string, fields: ArticleFields) {
+  async function checkPublication(id: string, fields: ArticleFields) {
     if (!fields.author || !fields.theme || !fields.source.name || !fields.source.url) {
       throw new CatalogError('请填写作者、主题、来源名称和原文链接', 400);
     }
     if (articleLength(fields) < 1000) {
       throw new CatalogError(fields.language === 'zh' ? '中文正文须至少 1000 个汉字' : '英文正文须至少 1000 个单词', 400);
     }
-    if (duplicate.get(fields.language, bodyHash(fields.text), id)) throw new CatalogError('已有相同正文的已发布文章', 409);
+    if ((await duplicate.get(fields.language, bodyHash(fields.text), id))) throw new CatalogError('已有相同正文的已发布文章', 409);
   }
 
-  function checkCoverage(previous: ArticleDetail, replacement?: ArticleFields) {
+  async function checkCoverage(previous: ArticleDetail, replacement?: ArticleFields) {
     if (previous.status !== 'published') return;
     const sameLanguage = replacement?.language === previous.language;
     if (sameLanguage && replacement?.difficulty === previous.difficulty) return;
-    const { total, stage } = remaining.get(previous.difficulty, previous.language, previous.id) as { total: number; stage: number };
+    const { total, stage } = (await remaining.get(previous.difficulty, previous.language, previous.id)) as { total: number; stage: number };
     if (stage < 1 || total + Number(sameLanguage) < 20) {
       throw new CatalogError('每种语言须保留至少 20 篇已发布文章，并覆盖全部难度', 409);
     }
   }
 
   return {
-    listPublic: () => (allPublic.all() as ArticleRow[]).map((row) => publicArticle(detail(row))),
-    findPublished(id: unknown) {
+    listPublic: async () => ((await allPublic.all()) as ArticleRow[]).map((row) => publicArticle(detail(row))),
+    async findPublished(id: unknown) {
       if (typeof id !== 'string' || id.length > 200) return undefined;
-      const row = publicById.get(id) as ArticleRow | undefined;
+      const row = (await publicById.get(id)) as ArticleRow | undefined;
       return row && publicArticle(detail(row));
     },
-    hasHistorical: (id: string, language: Language, difficulty: Difficulty) => !!hasGroup.get(id, language, difficulty),
-    counts() {
+    hasHistorical: async (id: string, language: Language, difficulty: Difficulty) => !!(await hasGroup.get(id, language, difficulty)),
+    async counts() {
       const counts = { draft: 0, published: 0, archived: 0 };
-      for (const { status, count } of countStatus.all() as { status: Status; count: number }[]) counts[status] = count;
+      for (const { status, count } of (await countStatus.all()) as { status: Status; count: number }[]) counts[status] = count;
       return counts;
     },
     find,
-    list({ page, pageSize, q, language, difficulty, status }: z.output<typeof listSchema>) {
+    async list({ page, pageSize, q, language, difficulty, status }: z.output<typeof listSchema>) {
       const params = { q, language: language ?? null, difficulty: difficulty ?? null, status: status ?? null, pageSize, offset: (page - 1) * pageSize };
-      const { total } = countRows.get(params) as { total: number };
-      const entries = (pageRows.all(params) as Omit<ArticleRow, 'text'>[]).map(({ source, ...row }) => ({ ...row, source: JSON.parse(source) as Article['source'] }));
+      const { total } = (await countRows.get(params)) as { total: number };
+      const entries = ((await pageRows.all(params)) as Omit<ArticleRow, 'text'>[]).map(({ source, ...row }) => ({ ...row, source: JSON.parse(source) as Article['source'] }));
       return { page, pageSize, total, entries };
     },
-    create: db.transaction((fields: ArticleFields, audit: Audit, actor: AdminActor) => {
+    create: db.transaction(async (fields: ArticleFields, audit: Audit, actor: AdminActor) => {
       const id = 'public-' + randomUUID();
-      insert.run({ ...columns(fields), id, status: 'draft', displayOrder: null });
-      audit(actor, 'article.create', 'article', id, fields.title, null);
-      return find(id)!;
+      (await insert.run({ ...columns(fields), id, status: 'draft', displayOrder: null }));
+      await audit(actor, 'article.create', 'article', id, fields.title, null);
+      return (await find(id))!;
     }).immediate,
-    edit: db.transaction((id: string, { revision, ...fields }: z.output<typeof editSchema>, audit: Audit, actor: AdminActor) => {
-      const previous = current(id, revision);
+    edit: db.transaction(async (id: string, { revision, ...fields }: z.output<typeof editSchema>, audit: Audit, actor: AdminActor) => {
+      const previous = await current(id, revision);
       if (previous.status === 'published') {
-        checkPublication(id, fields);
-        checkCoverage(previous, fields);
-        recordGroup.run(id, fields.language, fields.difficulty);
+        await checkPublication(id, fields);
+        await checkCoverage(previous, fields);
+        (await recordGroup.run(id, fields.language, fields.difficulty));
       }
-      update.run({ ...columns(fields), id });
-      audit(actor, 'article.update', 'article', id, fields.title, null);
-      return find(id)!;
+      (await update.run({ ...columns(fields), id }));
+      await audit(actor, 'article.update', 'article', id, fields.title, null);
+      return (await find(id))!;
     }).immediate,
-    setStatus: db.transaction((id: string, input: z.output<typeof statusSchema>, audit: Audit, actor: AdminActor) => {
-      const previous = current(id, input.revision);
+    setStatus: db.transaction(async (id: string, input: z.output<typeof statusSchema>, audit: Audit, actor: AdminActor) => {
+      const previous = await current(id, input.revision);
       const publishing = input.status === 'published';
       if (publishing) {
         if (previous.status === 'published') throw new CatalogError('文章已发布', 409);
-        checkPublication(id, previous);
-        recordGroup.run(id, previous.language, previous.difficulty);
+        await checkPublication(id, previous);
+        (await recordGroup.run(id, previous.language, previous.difficulty));
       } else {
         if (previous.status !== 'published') throw new CatalogError('仅可归档已发布文章', 409);
-        checkCoverage(previous);
+        await checkCoverage(previous);
       }
-      setStatus.run(input.status, now(), id);
-      audit(actor, publishing ? 'article.publish' : 'article.archive', 'article', id, previous.title, input.reason ?? null);
-      return find(id)!;
+      (await setStatus.run(input.status, now(), id));
+      await audit(actor, publishing ? 'article.publish' : 'article.archive', 'article', id, previous.title, input.reason ?? null);
+      return (await find(id))!;
     }).immediate,
-    remove: db.transaction((id: string, input: z.output<typeof deleteSchema>, audit: Audit, actor: AdminActor) => {
-      const previous = current(id, input.revision);
+    remove: db.transaction(async (id: string, input: z.output<typeof deleteSchema>, audit: Audit, actor: AdminActor) => {
+      const previous = await current(id, input.revision);
       if (previous.status === 'published') throw new CatalogError('请先归档文章', 409);
-      remove.run(now(), id);
-      audit(actor, 'article.delete', 'article', id, previous.title, input.reason);
+      (await remove.run(now(), id));
+      await audit(actor, 'article.delete', 'article', id, previous.title, input.reason);
     }).immediate,
   };
 }
 
-export function registerCatalogRoutes(app: FastifyInstance, catalog: ReturnType<typeof createCatalogStore>, audit: Audit) {
+export function registerCatalogRoutes(app: FastifyInstance, catalog: Awaited<ReturnType<typeof createCatalogStore>>, audit: Audit) {
   type ArticleRequest = { Params: { id: string } };
   const invalid = (reply: FastifyReply) => reply.code(400).send({ error: '文章信息或筛选条件无效' });
   const forbidden = (reply: FastifyReply) => reply.code(403).send({ error: '没有管理权限' });
-  function change(reply: FastifyReply, action: () => unknown) {
-    try { return action(); }
+  async function change(reply: FastifyReply, action: () => unknown) {
+    try { return await action(); }
     catch (error) {
       if (error instanceof Error && 'statusCode' in error && error.statusCode === 403) {
         return reply.code(403).send({ error: error.message });
@@ -244,7 +244,7 @@ export function registerCatalogRoutes(app: FastifyInstance, catalog: ReturnType<
   });
   app.get<ArticleRequest>('/articles/:id', async (request, reply) => {
     if (!request.admin) return forbidden(reply);
-    const article = catalog.find(request.params.id);
+    const article = await catalog.find(request.params.id);
     return article ? { article } : reply.code(404).send({ error: '文章不存在' });
   });
   app.post('/articles', async (request, reply) => {
@@ -252,29 +252,29 @@ export function registerCatalogRoutes(app: FastifyInstance, catalog: ReturnType<
     if (!actor) return forbidden(reply);
     const input = articleSchema.safeParse(request.body);
     if (!input.success) return invalid(reply);
-    return change(reply, () => reply.code(201).send({ article: catalog.create(input.data, audit, actor) }));
+    return change(reply, async () => reply.code(201).send({ article: await catalog.create(input.data, audit, actor) }));
   });
   app.post<ArticleRequest>('/articles/:id', async (request, reply) => {
     const actor = request.admin;
     if (!actor) return forbidden(reply);
     const input = editSchema.safeParse(request.body);
     if (!input.success) return invalid(reply);
-    return change(reply, () => ({ article: catalog.edit(request.params.id, input.data, audit, actor) }));
+    return change(reply, async () => ({ article: await catalog.edit(request.params.id, input.data, audit, actor) }));
   });
   app.post<ArticleRequest>('/articles/:id/status', async (request, reply) => {
     const actor = request.admin;
     if (!actor) return forbidden(reply);
     const input = statusSchema.safeParse(request.body);
     if (!input.success) return invalid(reply);
-    return change(reply, () => ({ article: catalog.setStatus(request.params.id, input.data, audit, actor) }));
+    return change(reply, async () => ({ article: await catalog.setStatus(request.params.id, input.data, audit, actor) }));
   });
   app.post<ArticleRequest>('/articles/:id/delete', async (request, reply) => {
     const actor = request.admin;
     if (!actor) return forbidden(reply);
     const input = deleteSchema.safeParse(request.body);
     if (!input.success) return invalid(reply);
-    return change(reply, () => {
-      catalog.remove(request.params.id, input.data, audit, actor);
+    return change(reply, async () => {
+      await catalog.remove(request.params.id, input.data, audit, actor);
       return { ok: true };
     });
   });

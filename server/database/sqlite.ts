@@ -1,6 +1,6 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import type Database from 'better-sqlite3';
-import type { AsyncDatabase, AsyncStatement, AsyncTransaction } from './types';
+import type { AsyncDatabase, AsyncStatement, AsyncTransaction } from './types.js';
 
 type Context = { active: boolean };
 

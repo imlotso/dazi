@@ -3,21 +3,33 @@ import cookie from '@fastify/cookie';
 import rateLimit from '@fastify/rate-limit';
 import staticFiles from '@fastify/static';
 import Database from 'better-sqlite3';
+import { AsyncSqlite } from './database/sqlite.js';
+import { AsyncPostgres } from './database/postgres.js';
+import { PostgresDatabase } from './postgres/database.js';
+import { postgresRateLimitStore } from './postgres/rate-limit.js';
+import { createAsyncWorkspaceStore } from './database/workspace.js';
+import { encodeEmail } from './database/email.js';
+import type { AsyncDatabase } from './database/types.js';
+import type { Pool } from 'pg';
+import { listPage, ListChangedError, ListCursorError, ListItemTooLargeError } from './list-pagination.js';
 import argon2 from 'argon2';
 import { createHash, createHmac, randomBytes, randomInt, randomUUID, timingSafeEqual } from 'node:crypto';
 import { existsSync } from 'node:fs';
-import { difficulties, type Difficulty, type Language } from '../src/data/articles';
-import { scoreTyping, splitCharacters } from '../src/lib/scoring';
-import { catalogSnapshotKey, type ArticleSnapshot, type PracticeMode, type RankingEntry } from '../src/lib/models';
-import { createWorkspaceStore, recoveryIdPattern, recoveryKeyPattern, syncBodyLimit, validateWorkspaceItems, WorkspaceChangedError, WorkspaceCursorError, WorkspaceLimitError, WorkspacePageSizeError } from './workspace';
-import { AdminAccessError, createAdminAudit, migrateAdministration, registerAdminRoutes } from './admin';
-import { createCatalogStore, registerCatalogRoutes } from './catalog';
-import { createSiteSettings, registerSiteSettingsRoutes } from './site-settings';
-import { createSmtpSettings, type Mailer, type SmtpConfiguration, type SmtpDelivery } from './smtp';
+import { difficulties, type Difficulty, type Language } from '../src/data/articles.js';
+import { scoreTyping, splitCharacters } from '../src/lib/scoring.js';
+import { catalogSnapshotKey, type ArticleSnapshot, type PracticeMode, type RankingEntry } from '../src/lib/models.js';
+import { recoveryIdPattern, recoveryKeyPattern, syncBodyLimit, validateWorkspaceItems, WorkspaceChangedError, WorkspaceCursorError, WorkspaceLimitError, WorkspacePageSizeError } from './workspace.js';
+import { AdminAccessError, createAdminAudit, migrateAdministration, registerAdminRoutes } from './admin.js';
+import { createCatalogStore, registerCatalogRoutes } from './catalog.js';
+import { createSiteSettings, registerSiteSettingsRoutes } from './site-settings.js';
+import { createSmtpSettings, type Mailer, type SmtpConfiguration, type SmtpDelivery } from './smtp.js';
 
-export type { Mailer } from './smtp';
+export type { Mailer } from './smtp.js';
 export type AppOptions = {
-  databasePath: string;
+  databasePath?: string;
+  databaseUrl?: string;
+  postgresSchema?: string;
+  onDatabasePool?: (pool: Pool) => void;
   now?: () => number;
   secureCookies?: boolean;
   mailer?: Mailer;
@@ -104,10 +116,23 @@ export async function createApp(options: AppOptions) {
   const secureCookies = options.secureCookies ?? process.env.NODE_ENV === 'production';
   const codeSecret = options.codeSecret || randomBytes(32).toString('hex');
   const adminEmail = cleanEmail(options.adminEmail);
-  const db = new Database(options.databasePath);
-  db.pragma('journal_mode = WAL');
-  db.pragma('foreign_keys = ON');
-  db.exec(`
+  let postgres: PostgresDatabase | undefined;
+  let db: AsyncDatabase;
+  if (options.databaseUrl) {
+    if (!options.codeSecret || options.codeSecret.length < 32) throw new Error('A stable CODE_SECRET is required for PostgreSQL');
+    postgres = new PostgresDatabase(options.databaseUrl, options.postgresSchema);
+    try { options.onDatabasePool?.(postgres.pool); await postgres.verifySchema(); }
+    catch (error) { await postgres.close(); throw error; }
+    db = new AsyncPostgres(postgres);
+  } else {
+    if (!options.databasePath) throw new Error('An explicit database configuration is required');
+    db = new AsyncSqlite(new Database(options.databasePath));
+  }
+  try {
+  if (db.dialect === 'sqlite') {
+  (await db.pragma('journal_mode = WAL'));
+  (await db.pragma('foreign_keys = ON'));
+  (await db.exec(`
     CREATE TABLE IF NOT EXISTS users (
       id TEXT PRIMARY KEY, username TEXT NOT NULL COLLATE NOCASE UNIQUE,
       email TEXT NOT NULL COLLATE NOCASE UNIQUE, password_hash TEXT NOT NULL, created_at INTEGER NOT NULL
@@ -134,9 +159,9 @@ export async function createApp(options: AppOptions) {
     );
     CREATE INDEX IF NOT EXISTS scores_rank ON scores(language, difficulty, duration, speed DESC, accuracy DESC, created_at ASC);
     CREATE INDEX IF NOT EXISTS challenges_owner ON challenges(owner, started_at DESC);
-  `);
-  const challengeColumns = new Set((db.pragma('table_info(challenges)') as Array<{ name: string }>).map((column) => column.name));
-  db.transaction(() => {
+  `));
+  const challengeColumns = new Set(((await db.pragma('table_info(challenges)')) as Array<{ name: string }>).map((column) => column.name));
+  await db.transaction(async () => {
     for (const [name, definition] of [
       ['checkpoints', 'INTEGER NOT NULL DEFAULT 0'],
       ['last_checkpoint_at', 'INTEGER'],
@@ -168,38 +193,48 @@ export async function createApp(options: AppOptions) {
       ['publish_recovered_at', 'INTEGER'],
       ['draft_id', 'TEXT'],
     ]) {
-      if (!challengeColumns.has(name)) db.exec(`ALTER TABLE challenges ADD COLUMN ${name} ${definition}`);
+      if (!challengeColumns.has(name)) (await db.exec(`ALTER TABLE challenges ADD COLUMN ${name} ${definition}`));
     }
     if (!challengeColumns.has('active_started_at')) {
-      db.exec("UPDATE challenges SET active_started_at=started_at WHERE status='active'");
+      (await db.exec("UPDATE challenges SET active_started_at=started_at WHERE status='active'"));
     }
     if (!challengeColumns.has('elapsed_ms')) {
-      db.exec('UPDATE challenges SET elapsed_ms=duration*1000, errors=MAX(0, COALESCE(total, 0)-COALESCE(correct, 0)) WHERE finished_at IS NOT NULL');
+      (await db.exec('UPDATE challenges SET elapsed_ms=duration*1000, errors=MAX(0, COALESCE(total, 0)-COALESCE(correct, 0)) WHERE finished_at IS NOT NULL'));
     }
     if (!challengeColumns.has('last_checkpoint_elapsed_ms')) {
-      db.exec('UPDATE challenges SET last_checkpoint_elapsed_ms=MAX(0,last_checkpoint_at-started_at) WHERE last_checkpoint_at IS NOT NULL');
+      (await db.exec('UPDATE challenges SET last_checkpoint_elapsed_ms=MAX(0,last_checkpoint_at-started_at) WHERE last_checkpoint_at IS NOT NULL'));
     }
     if (!challengeColumns.has('ranking_removed')) {
       // Legacy removals only deleted the best score row. Published attempts without
       // a score row are ambiguous, so preserve the visible legacy rankings.
-      db.exec(`UPDATE challenges SET ranking_removed=1 WHERE published=1 AND status='finished'
-        AND NOT EXISTS (SELECT 1 FROM scores WHERE scores.attempt_id=challenges.id)`);
+      (await db.exec(`UPDATE challenges SET ranking_removed=1 WHERE published=1 AND status='finished'
+        AND NOT EXISTS (SELECT 1 FROM scores WHERE scores.attempt_id=challenges.id)`));
     }
-    db.exec(`CREATE INDEX IF NOT EXISTS challenges_rank
+    (await db.exec(`CREATE INDEX IF NOT EXISTS challenges_rank
       ON challenges(language, difficulty, mode, strict, finished_at)
-      WHERE published=1 AND status='finished' AND ranking_removed=0`);
+      WHERE published=1 AND status='finished' AND ranking_removed=0`));
   })();
-  const workspace = createWorkspaceStore(db);
-  migrateAdministration(db, adminEmail);
-  const catalog = createCatalogStore(db, now);
+  }
+  const workspace = await createAsyncWorkspaceStore(db);
+  if (db.dialect === 'sqlite') await migrateAdministration(db, adminEmail);
+  const catalog = await createCatalogStore(db, now);
   const audit = createAdminAudit(db, now);
-  const siteSettings = createSiteSettings(db, audit);
-  const smtp = createSmtpSettings(db, { codeSecret: options.codeSecret, deployment: options.smtp, fallbackMailer: options.mailer, delivery: options.smtpDelivery, now });
+  const siteSettings = await createSiteSettings(db, audit);
+  const smtp = await createSmtpSettings(db, { codeSecret: options.codeSecret, deployment: options.smtp, fallbackMailer: options.mailer, delivery: options.smtpDelivery, now });
+  if (db.dialect === 'postgres') await smtp.assertStoredSecret();
 
   const app = Fastify({ logger: false, bodyLimit: 128 * 1024, trustProxy: options.trustProxy ?? false });
+  const sendUnexpectedError = (error: unknown, reply: FastifyReply) => {
+    const status = error && typeof error === 'object' && 'statusCode' in error && typeof error.statusCode === 'number'
+      ? error.statusCode : 500;
+    if (status >= 400 && status < 500) return reply.code(status).send({ error: status === 429 ? '请求过于频繁' : '请求无法处理' });
+    return reply.code(500).send({ error: '服务暂时不可用，请稍后重试' });
+  };
+  app.setErrorHandler((error, _request, reply) => sendUnexpectedError(error, reply));
   await app.register(cookie);
-  await app.register(rateLimit, { max: 180, timeWindow: '1 minute', allowList: (request) => !request.url.startsWith('/api/') });
-  app.addHook('onClose', async () => { db.close(); });
+  await app.register(rateLimit, { max: 180, timeWindow: '1 minute', allowList: (request) => !request.url.startsWith('/api/'),
+    ...(postgres && { store: postgresRateLimitStore(postgres.pool, codeSecret, postgres.schema), skipOnError: false }) });
+  app.addHook('onClose', async () => { await db.close(); });
   app.addHook('onRequest', async (request, reply) => {
     if (request.method === 'GET' || request.method === 'HEAD' || !request.headers.origin) return;
     try {
@@ -208,19 +243,24 @@ export async function createApp(options: AppOptions) {
   });
 
   const cookieOptions = { path: '/', httpOnly: true, sameSite: 'strict' as const, secure: secureCookies };
-  const userFor = (request: FastifyRequest): User | undefined => {
+  const userFor = async (request: FastifyRequest): Promise<User | undefined> => {
     const token = request.cookies.session;
     if (!token || token.length > 100) return undefined;
-    return db.prepare('SELECT u.* FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token_hash = ? AND s.expires_at > ? AND u.disabled_at IS NULL').get(digest(token), now()) as User | undefined;
+    return (await db.prepare('SELECT u.* FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token_hash = ? AND s.expires_at > ? AND u.disabled_at IS NULL').get(digest(token), now())) as User | undefined;
   };
   const expectedAccount = (request: FastifyRequest) => request.headers['x-workspace-owner'];
   const accountMatches = (request: FastifyRequest, user: User) =>
     expectedAccount(request) === undefined || expectedAccount(request) === user.id;
   const publicUser = (user: User) => ({ id: user.id, username: user.username, email: user.email, isAdmin: user.role === 'admin' });
-  const startSession = (reply: FastifyReply, user: User) => {
+  const usernameEquals = db.dialect === 'postgres'
+    ? `translate(username,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz') COLLATE "C" = translate(?,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz') COLLATE "C"`
+    : 'username = ?';
+  const userEmailEquals = db.dialect === 'postgres' ? 'dazi_email_key(email)=dazi_email_key(?)' : 'email = ?';
+  const storageEmail = (email: string) => db.dialect === 'postgres' ? encodeEmail(email) : email;
+  const startSession = async (reply: FastifyReply, user: User) => {
     const token = randomBytes(32).toString('base64url');
-    const inserted = db.prepare('INSERT INTO sessions(token_hash,user_id,expires_at) SELECT ?,id,? FROM users WHERE id=? AND password_hash=? AND auth_version=? AND disabled_at IS NULL')
-      .run(digest(token), now() + 30 * 86400_000, user.id, user.password_hash, user.auth_version);
+    const inserted = (await db.prepare('INSERT INTO sessions(token_hash,user_id,expires_at) SELECT ?,id,? FROM users WHERE id=? AND password_hash=? AND auth_version=? AND disabled_at IS NULL')
+      .run(digest(token), now() + 30 * 86400_000, user.id, user.password_hash, user.auth_version));
     if (!inserted.changes) return false;
     reply.setCookie('session', token, { ...cookieOptions, maxAge: 30 * 86400 });
     return true;
@@ -234,38 +274,38 @@ export async function createApp(options: AppOptions) {
     }
     return `g:${digest(guest)}`;
   };
-  const getOwner = (request: FastifyRequest, reply: FastifyReply, create = true): string | null => {
-    const user = userFor(request);
+  const getOwner = async (request: FastifyRequest, reply: FastifyReply, create = true): Promise<string | null> => {
+    const user = (await userFor(request));
     return user ? `u:${user.id}` : getGuestOwner(request, reply, create);
   };
   const getCodeHash = (email: string, purpose: string, code: string) => createHmac('sha256', codeSecret).update(`${email}\0${purpose}\0${code}`).digest('hex');
-  const verifyCode = (email: string, purpose: string, code: string, consume = true): boolean => {
-    const row = db.prepare('SELECT * FROM email_codes WHERE email = ? AND purpose = ?').get(email, purpose) as { code_hash: string; expires_at: number; attempts: number } | undefined;
+  const verifyCode = async (email: string, purpose: string, code: string, consume = true): Promise<boolean> => {
+    const row = (await db.prepare('SELECT * FROM email_codes WHERE email = ? AND purpose = ?').get(storageEmail(email), purpose)) as { code_hash: string; expires_at: number; attempts: number } | undefined;
     if (!row || row.expires_at < now() || row.attempts >= 5 || !/^\d{6}$/.test(code)) return false;
     const supplied = Buffer.from(getCodeHash(email, purpose, code), 'hex');
     const stored = Buffer.from(row.code_hash, 'hex');
     if (supplied.length !== stored.length || !timingSafeEqual(supplied, stored)) {
-      db.prepare('UPDATE email_codes SET attempts=attempts+1 WHERE email=? AND purpose=? AND code_hash=? AND attempts<5').run(email, purpose, row.code_hash);
+      (await db.prepare('UPDATE email_codes SET attempts=attempts+1 WHERE email=? AND purpose=? AND code_hash=? AND attempts<5').run(storageEmail(email), purpose, row.code_hash));
       return false;
     }
     if (!consume) return true;
-    return db.prepare('DELETE FROM email_codes WHERE email=? AND purpose=? AND code_hash=? AND expires_at>=? AND attempts<5')
-      .run(email, purpose, row.code_hash, now()).changes === 1;
+    return (await db.prepare('DELETE FROM email_codes WHERE email=? AND purpose=? AND code_hash=? AND expires_at>=? AND attempts<5')
+      .run(storageEmail(email), purpose, row.code_hash, now())).changes === 1;
   };
-  const saveScore = (challenge: Pick<Challenge, 'id' | 'owner' | 'language' | 'difficulty' | 'duration' | 'nickname' | 'speed' | 'accuracy' | 'correct' | 'finished_at'>) => {
-    db.prepare(`INSERT INTO scores(owner, language, difficulty, duration, nickname, speed, accuracy, correct, created_at, attempt_id)
+  const saveScore = async (challenge: Pick<Challenge, 'id' | 'owner' | 'language' | 'difficulty' | 'duration' | 'nickname' | 'speed' | 'accuracy' | 'correct' | 'finished_at'>) => {
+    (await db.prepare(`INSERT INTO scores(owner, language, difficulty, duration, nickname, speed, accuracy, correct, created_at, attempt_id)
       VALUES (@owner, @language, @difficulty, @duration, @nickname, @speed, @accuracy, @correct, @finished_at, @id)
       ON CONFLICT(owner, language, difficulty, duration) DO UPDATE SET
         nickname=excluded.nickname, speed=excluded.speed, accuracy=excluded.accuracy, correct=excluded.correct,
         created_at=excluded.created_at, attempt_id=excluded.attempt_id
       WHERE excluded.speed > scores.speed OR (excluded.speed = scores.speed AND excluded.accuracy > scores.accuracy)`)
-      .run(challenge);
+      .run(challenge));
   };
   await app.register(async (admin) => {
     admin.decorateRequest('admin');
     const authorize = async (request: FastifyRequest, reply: FastifyReply) => {
       reply.header('Cache-Control', 'no-store');
-      const user = userFor(request);
+      const user = (await userFor(request));
       if (!user || user.role !== 'admin') return invalid(reply, '没有管理权限', 403);
       if (!accountMatches(request, user)) return invalid(reply, '登录账号已变更', 403);
       request.admin = { id: user.id, username: user.username, authVersion: user.auth_version };
@@ -274,13 +314,13 @@ export async function createApp(options: AppOptions) {
     admin.addHook('preHandler', authorize);
     admin.setErrorHandler((error, _request, reply) => {
       if (error instanceof AdminAccessError) return invalid(reply, error.message, error.statusCode);
-      return reply.send(error);
+      return sendUnexpectedError(error, reply);
     });
-    registerAdminRoutes(admin, { db, now, audit, publishedArticleCount: () => catalog.counts().published, saveScore });
+    registerAdminRoutes(admin, { db, now, audit, publishedArticleCount: async () => (await catalog.counts()).published, saveScore });
     registerCatalogRoutes(admin, catalog, audit);
     registerSiteSettingsRoutes(admin, siteSettings);
-    smtp.register(admin, audit, (request) => {
-      const current = userFor(request);
+    smtp.register(admin, audit, async (request) => {
+      const current = (await userFor(request));
       if (!current || current.role !== 'admin' || current.id !== request.admin.id || current.auth_version !== request.admin.authVersion) {
         throw new AdminAccessError();
       }
@@ -289,7 +329,7 @@ export async function createApp(options: AppOptions) {
 
   app.get('/api/health', async () => ({ ok: true }));
   app.get('/api/me', async (request, reply) => {
-    const user = userFor(request);
+    const user = (await userFor(request));
     reply.header('Cache-Control', 'no-store');
     if (!user) getGuestOwner(request, reply, true);
     return { user: user ? publicUser(user) : null };
@@ -299,54 +339,56 @@ export async function createApp(options: AppOptions) {
     const body = bodyOf(request);
     const email = cleanEmail(body.email);
     const purpose = body.purpose;
-    if (purpose === 'register' && !siteSettings.read().settings.registrationEnabled) return invalid(reply, '当前已关闭注册', 403);
+    if (purpose === 'register' && !(await siteSettings.read()).settings.registrationEnabled) return invalid(reply, '当前已关闭注册', 403);
     if (!emailPattern.test(email) || email.length > 254 || !['register', 'login', 'reset'].includes(String(purpose))) return invalid(reply, '请输入有效邮箱');
-    const existingUser = db.prepare('SELECT disabled_at FROM users WHERE email = ?').get(email) as { disabled_at: number | null } | undefined;
+    const existingUser = (await db.prepare(`SELECT disabled_at FROM users WHERE ${userEmailEquals}`).get(storageEmail(email))) as { disabled_at: number | null } | undefined;
     if ((purpose === 'register' && existingUser) || (purpose !== 'register' && (!existingUser || existingUser.disabled_at !== null))) return { ok: true };
-    const previous = db.prepare('SELECT created_at FROM email_codes WHERE email = ? AND purpose = ?').get(email, purpose) as { created_at: number } | undefined;
+    const previous = (await db.prepare('SELECT created_at FROM email_codes WHERE email = ? AND purpose = ?').get(storageEmail(email), purpose)) as { created_at: number } | undefined;
     if (previous && now() - previous.created_at < 60_000) return invalid(reply, '请稍后再获取验证码', 429);
-    const mailer = smtp.mailer();
+    const mailer = (await smtp.mailer());
     if (!mailer) return invalid(reply, '邮件服务尚未配置，请稍后再试', 503);
     const code = String(randomInt(0, 1_000_000)).padStart(6, '0');
     const codeHash = getCodeHash(email, String(purpose), code);
     const issuedAt = now();
-    db.prepare(`INSERT INTO email_codes(email,purpose,code_hash,created_at,expires_at,attempts) VALUES (?,?,?,?,?,0)
-      ON CONFLICT(email,purpose) DO UPDATE SET code_hash=excluded.code_hash,created_at=excluded.created_at,expires_at=excluded.expires_at,attempts=0`)
-      .run(email, purpose, codeHash, issuedAt, issuedAt + 10 * 60_000);
+    const issued = await db.prepare(`INSERT INTO email_codes(email,purpose,code_hash,created_at,expires_at,attempts) VALUES (?,?,?,?,?,0)
+      ON CONFLICT(email,purpose) DO UPDATE SET code_hash=excluded.code_hash,created_at=excluded.created_at,expires_at=excluded.expires_at,attempts=0
+      WHERE email_codes.created_at<=excluded.created_at-60000`)
+      .run(storageEmail(email), purpose, codeHash, issuedAt, issuedAt + 10 * 60_000);
+    if (!issued.changes) return invalid(reply, '请稍后再获取验证码', 429);
     try { await mailer.sendCode(email, code, String(purpose)); }
     catch {
-      db.prepare('DELETE FROM email_codes WHERE email = ? AND purpose = ? AND code_hash = ?').run(email, purpose, codeHash);
+      (await db.prepare('DELETE FROM email_codes WHERE email = ? AND purpose = ? AND code_hash = ?').run(storageEmail(email), purpose, codeHash));
       return invalid(reply, '邮件发送失败，请稍后再试', 503);
     }
     return { ok: true };
   });
 
   app.post('/api/auth/register', { config: { rateLimit: { max: 10, timeWindow: '1 minute' } } }, async (request, reply) => {
-    if (!siteSettings.read().settings.registrationEnabled) return invalid(reply, '当前已关闭注册', 403);
+    if (!(await siteSettings.read()).settings.registrationEnabled) return invalid(reply, '当前已关闭注册', 403);
     const body = bodyOf(request);
     const email = cleanEmail(body.email);
     const username = typeof body.username === 'string' ? body.username.trim() : '';
     const password = typeof body.password === 'string' ? body.password : '';
     const code = typeof body.code === 'string' ? body.code : '';
     if (!emailPattern.test(email) || email.length > 254 || !/^[\p{L}\p{N}_-]{3,24}$/u.test(username) || password.length < 10 || password.length > 128) return invalid(reply, '用户名需为 3–24 位字母、数字或下划线，密码至少 10 位');
-    if (db.prepare('SELECT id FROM users WHERE email = ? OR username = ?').get(email, username)) return invalid(reply, '账号信息不可用，请检查后重试', 409);
-    if (!verifyCode(email, 'register', code, false)) return invalid(reply, '验证码错误或已过期');
+    if ((await db.prepare(`SELECT id FROM users WHERE ${userEmailEquals} OR ${usernameEquals}`).get(storageEmail(email), username))) return invalid(reply, '账号信息不可用，请检查后重试', 409);
+    if (!(await verifyCode(email, 'register', code, false))) return invalid(reply, '验证码错误或已过期');
     const passwordHash = await argon2.hash(password, { type: argon2.argon2id });
-    const registration = db.transaction((): { user: User } | { error: string; status: number } => {
-      if (!siteSettings.read().settings.registrationEnabled) return { error: '当前已关闭注册', status: 403 };
-      if (db.prepare('SELECT id FROM users WHERE email=? OR username=?').get(email, username)) {
+    const registration = await db.transaction(async (): Promise<{ user: User } | { error: string; status: number }> => {
+      if (!(await siteSettings.read()).settings.registrationEnabled) return { error: '当前已关闭注册', status: 403 };
+      if ((await db.prepare(`SELECT id FROM users WHERE ${userEmailEquals} OR ${usernameEquals}`).get(storageEmail(email), username))) {
         return { error: '账号信息不可用，请检查后重试', status: 409 };
       }
-      if (!verifyCode(email, 'register', code)) return { error: '验证码错误或已过期', status: 400 };
-      const bootstrap = email === adminEmail && !db.prepare("SELECT 1 FROM users WHERE role='admin' LIMIT 1").get();
+      if (!(await verifyCode(email, 'register', code))) return { error: '验证码错误或已过期', status: 400 };
+      const bootstrap = email === adminEmail && !(await db.prepare("SELECT 1 FROM users WHERE role='admin' LIMIT 1").get());
       const account: User = { id: randomUUID(), username, email, password_hash: passwordHash, role: bootstrap ? 'admin' : 'user', auth_version: 0 };
-      db.prepare('INSERT INTO users(id,username,email,password_hash,role,created_at) VALUES (?,?,?,?,?,?)')
-        .run(account.id, account.username, account.email, account.password_hash, account.role, now());
+      (await db.prepare('INSERT INTO users(id,username,email,password_hash,role,created_at) VALUES (?,?,?,?,?,?)')
+        .run(account.id, account.username, storageEmail(account.email), account.password_hash, account.role, now()));
       return { user: account };
     }).immediate();
     if ('error' in registration) return invalid(reply, registration.error, registration.status);
     const { user } = registration;
-    if (!startSession(reply, user)) return invalid(reply, '账号或密码不正确', 401);
+    if (!(await startSession(reply, user))) return invalid(reply, '账号或密码不正确', 401);
     return { user: publicUser(user) };
   });
 
@@ -355,9 +397,10 @@ export async function createApp(options: AppOptions) {
     const identifier = typeof body.identifier === 'string' ? body.identifier.trim() : '';
     const password = typeof body.password === 'string' ? body.password : '';
     if (identifier.length > 254 || password.length > 128) return invalid(reply, '账号或密码不正确', 401);
-    const user = db.prepare('SELECT * FROM users WHERE (username = ? OR email = ?) AND disabled_at IS NULL').get(identifier, identifier.toLowerCase()) as User | undefined;
+    const usernameIdentifier = db.dialect === 'postgres' && identifier.includes('\0') ? '' : identifier;
+    const user = (await db.prepare(`SELECT * FROM users WHERE (${usernameEquals} OR ${userEmailEquals}) AND disabled_at IS NULL`).get(usernameIdentifier, storageEmail(identifier.toLowerCase()))) as User | undefined;
     if (!user || !(await argon2.verify(user.password_hash, password))) return invalid(reply, '账号或密码不正确', 401);
-    if (!startSession(reply, user)) return invalid(reply, '账号或密码不正确', 401);
+    if (!(await startSession(reply, user))) return invalid(reply, '账号或密码不正确', 401);
     return { user: publicUser(user) };
   });
 
@@ -365,9 +408,9 @@ export async function createApp(options: AppOptions) {
     const body = bodyOf(request);
     const email = cleanEmail(body.email);
     const code = typeof body.code === 'string' ? body.code : '';
-    const user = db.prepare('SELECT * FROM users WHERE email = ? AND disabled_at IS NULL').get(email) as User | undefined;
-    if (!user || !verifyCode(email, 'login', code)) return invalid(reply, '邮箱或验证码不正确', 401);
-    if (!startSession(reply, user)) return invalid(reply, '邮箱或验证码不正确', 401);
+    const user = (await db.prepare(`SELECT * FROM users WHERE ${userEmailEquals} AND disabled_at IS NULL`).get(storageEmail(email))) as User | undefined;
+    if (!user || !(await verifyCode(email, 'login', code))) return invalid(reply, '邮箱或验证码不正确', 401);
+    if (!(await startSession(reply, user))) return invalid(reply, '邮箱或验证码不正确', 401);
     return { user: publicUser(user) };
   });
 
@@ -376,15 +419,15 @@ export async function createApp(options: AppOptions) {
     const email = cleanEmail(body.email);
     const code = typeof body.code === 'string' ? body.code : '';
     const password = typeof body.password === 'string' ? body.password : '';
-    const user = db.prepare('SELECT * FROM users WHERE email = ? AND disabled_at IS NULL').get(email) as User | undefined;
-    if (!user || password.length < 10 || password.length > 128 || !verifyCode(email, 'reset', code)) return invalid(reply, '邮箱、验证码或新密码不正确');
+    const user = (await db.prepare(`SELECT * FROM users WHERE ${userEmailEquals} AND disabled_at IS NULL`).get(storageEmail(email))) as User | undefined;
+    if (!user || password.length < 10 || password.length > 128 || !(await verifyCode(email, 'reset', code))) return invalid(reply, '邮箱、验证码或新密码不正确');
     const hash = await argon2.hash(password, { type: argon2.argon2id });
-    const reset = db.transaction(() => {
-      const changed = db.prepare('UPDATE users SET password_hash=?,auth_version=auth_version+1 WHERE id=? AND auth_version=? AND disabled_at IS NULL')
-        .run(hash, user.id, user.auth_version).changes;
+    const reset = await db.transaction(async () => {
+      const changed = (await db.prepare('UPDATE users SET password_hash=?,auth_version=auth_version+1 WHERE id=? AND auth_version=? AND disabled_at IS NULL')
+        .run(hash, user.id, user.auth_version)).changes;
       if (!changed) return false;
-      db.prepare('DELETE FROM sessions WHERE user_id = ?').run(user.id);
-      db.prepare('DELETE FROM email_codes WHERE email = ?').run(email);
+      (await db.prepare('DELETE FROM sessions WHERE user_id = ?').run(user.id));
+      (await db.prepare('DELETE FROM email_codes WHERE email = ?').run(storageEmail(email)));
       return true;
     }).immediate();
     if (!reset) return invalid(reply, '邮箱、验证码或新密码不正确');
@@ -393,17 +436,17 @@ export async function createApp(options: AppOptions) {
   });
 
   app.post('/api/auth/logout', async (request, reply) => {
-    const current = userFor(request);
+    const current = (await userFor(request));
     if (current && !accountMatches(request, current)) return invalid(reply, '登录账号已变更', 403);
-    if (request.cookies.session) db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(digest(request.cookies.session));
+    if (request.cookies.session) (await db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(digest(request.cookies.session)));
     // A delayed response from a former account must not erase a newer login cookie.
     // Scoped clients only revoke their token; an inert cookie is replaced on the next login.
     if (expectedAccount(request) === undefined) reply.clearCookie('session', cookieOptions);
     return { ok: true };
   });
 
-  function workspaceResponse(request: FastifyRequest, owner: string, serverTime: number) {
-    const items = workspace.get(owner);
+  async function workspaceResponse(request: FastifyRequest, owner: string, serverTime: number) {
+    const items = (await workspace.get(owner));
     const known = request.headers['x-workspace-backgrounds'];
     if (typeof known !== 'string') return { items, serverTime };
     const backgrounds = items.filter((item) => item.kind === 'background');
@@ -419,7 +462,7 @@ export async function createApp(options: AppOptions) {
     (request.query as { paged?: string }).paged === '1' || request.headers['x-workspace-paged'] === '1';
 
   app.get('/api/workspace', async (request, reply) => {
-    const user = userFor(request);
+    const user = (await userFor(request));
     if (!user) return invalid(reply, '请先登录', 401);
     if (!accountMatches(request, user)) return invalid(reply, '登录账号已变更', 403);
     reply.header('Cache-Control', 'no-store');
@@ -428,7 +471,7 @@ export async function createApp(options: AppOptions) {
       if (rawCursor !== undefined && typeof rawCursor !== 'string') return invalid(reply, '同步游标无效');
       const known = request.headers['x-workspace-backgrounds'];
       try {
-        return { ...workspace.pagedSnapshot(user.id, rawCursor, typeof known === 'string' ? known : undefined), serverTime: now() };
+        return { ...(await workspace.pagedSnapshot(user.id, rawCursor, typeof known === 'string' ? known : undefined)), serverTime: now() };
       } catch (error) {
         if (error instanceof WorkspaceCursorError) return invalid(reply, '同步游标无效');
         if (error instanceof WorkspaceChangedError) return reply.code(409).send({ error: '同步数据已变更，请重试', code: 'WORKSPACE_CHANGED' });
@@ -436,45 +479,57 @@ export async function createApp(options: AppOptions) {
         throw error;
       }
     }
-    return workspaceResponse(request, user.id, now());
+    return (await workspaceResponse(request, user.id, now()));
   });
 
   app.post('/api/workspace/sync', { bodyLimit: syncBodyLimit }, async (request, reply) => {
-    const user = userFor(request);
+    const user = (await userFor(request));
     if (!user) return invalid(reply, '请先登录', 401);
     if (!accountMatches(request, user)) return invalid(reply, '登录账号已变更', 403);
     const serverTime = now();
     const items = validateWorkspaceItems(bodyOf(request).items, user.id, serverTime);
     if (!items) return invalid(reply, '同步数据无效');
-    try { workspace.merge(user.id, items); }
+    try {
+      const saved = await db.transaction(async () => {
+        const current = await userFor(request);
+        if (!current || current.id !== user.id || current.auth_version !== user.auth_version) return null;
+        await workspace.merge(user.id, items);
+        const known = request.headers['x-workspace-backgrounds'];
+        return await workspace.backgroundState(user.id, typeof known === 'string' ? known : undefined);
+      })();
+      if (!saved) return invalid(reply, '请先登录', 401);
+      reply.header('Cache-Control', 'no-store');
+      if (pagedWorkspace(request)) return { acknowledged: true, items: [], serverTime, ...saved };
+    }
     catch (error) {
       if (error instanceof WorkspaceLimitError) return invalid(reply, '同步空间已满', 413);
       throw error;
     }
     reply.header('Cache-Control', 'no-store');
-    if (pagedWorkspace(request)) return { acknowledged: true, serverTime };
-    return workspaceResponse(request, user.id, serverTime);
+    return (await workspaceResponse(request, user.id, serverTime));
   });
 
-  const findOwnedChallenge = (request: FastifyRequest, reply: FastifyReply) => {
+  const findOwnedChallenge = async (request: FastifyRequest, reply: FastifyReply) => {
     const { id } = request.params as { id: string };
-    const owner = getOwner(request, reply, false);
+    const owner = (await getOwner(request, reply, false));
     if (!owner) return undefined;
-    return db.prepare('SELECT * FROM challenges WHERE id=? AND owner=?').get(id, owner) as Challenge | undefined;
+    return (await db.prepare('SELECT * FROM challenges WHERE id=? AND owner=?').get(id, owner)) as Challenge | undefined;
   };
-  const findWorkspaceDraft = db.prepare(`SELECT value IS NULL AS deleted,
-    COALESCE(json_extract(value, '$.claimVersion'), 0) AS claimVersion,
-    json_extract(value, '$.progressVersion') AS progressVersion, json_extract(value, '$.recoveryMarker') AS recoveryMarker
-    FROM workspace_items WHERE user_id=? AND kind='draft' AND item_id=?`);
-  const draftFor = (owner: string, id: string) => owner.startsWith('u:')
-    ? findWorkspaceDraft.get(owner.slice(2), id) as {
-      deleted: number; claimVersion: number; progressVersion: number | null; recoveryMarker: string | null;
-    } | undefined
-    : undefined;
+  const findWorkspaceDraft = db.prepare("SELECT value FROM workspace_items WHERE user_id=? AND kind='draft' AND item_id=?");
+  const draftFor = async (owner: string, id: string) => {
+    if (!owner.startsWith('u:')) return undefined;
+    const row = await findWorkspaceDraft.get(owner.slice(2), id) as { value: string | null } | undefined;
+    if (!row) return undefined;
+    const value = row.value === null ? {} : JSON.parse(row.value) as {
+      claimVersion?: number; progressVersion?: number; recoveryMarker?: string;
+    };
+    return { deleted: Number(row.value === null), claimVersion: value.claimVersion ?? 0,
+      progressVersion: value.progressVersion ?? null, recoveryMarker: value.recoveryMarker ?? null };
+  };
   const draftStillPresent = `NOT EXISTS (SELECT 1 FROM workspace_items WHERE user_id=substr(challenges.owner, 3)
     AND substr(challenges.owner, 1, 2)='u:' AND kind='draft' AND item_id=challenges.draft_id AND value IS NULL)`;
-  const requireOwnedChallenge = (request: FastifyRequest, reply: FastifyReply) => {
-    const challenge = findOwnedChallenge(request, reply);
+  const requireOwnedChallenge = async (request: FastifyRequest, reply: FastifyReply) => {
+    const challenge = (await findOwnedChallenge(request, reply));
     if (!challenge) {
       invalid(reply, '练习记录不存在', 404);
       return undefined;
@@ -484,18 +539,34 @@ export async function createApp(options: AppOptions) {
       return undefined;
     }
     if ((challenge.status === 'active' || challenge.status === 'paused') &&
-      challenge.draft_id && draftFor(challenge.owner, challenge.draft_id)?.deleted) {
+      challenge.draft_id && (await draftFor(challenge.owner, challenge.draft_id))?.deleted) {
       reply.code(409).send(draftDeleted);
       return undefined;
     }
     return challenge;
   };
-  const challengeChanged = (request: FastifyRequest, reply: FastifyReply) =>
-    requireOwnedChallenge(request, reply) ? invalid(reply, '练习状态已变更', 409) : reply;
+  const challengeChanged = async (request: FastifyRequest, reply: FastifyReply) =>
+    (await requireOwnedChallenge(request, reply)) ? invalid(reply, '练习状态已变更', 409) : reply;
+
+  function boundedList<T>(request: FastifyRequest, reply: FastifyReply, field: 'articles' | 'entries', items: T[]) {
+    if (request.headers['x-list-paged'] !== '1') return { [field]: items };
+    const cursor = request.headers['x-list-cursor'];
+    if (cursor !== undefined && typeof cursor !== 'string') return invalid(reply, '分页游标无效');
+    try {
+      const page = listPage(items, cursor);
+      return { [field]: page.items, nextCursor: page.nextCursor };
+    } catch (error) {
+      if (error instanceof ListCursorError) return invalid(reply, '分页游标无效');
+      if (error instanceof ListChangedError) return reply.code(409).send({ error: '列表已变更，请重试', code: 'LIST_CHANGED' });
+      if (error instanceof ListItemTooLargeError) return invalid(reply, '单项数据过大', 413);
+      throw error;
+    }
+  }
 
   app.get('/api/articles', async (_request, reply) => {
     reply.header('Cache-Control', 'no-store');
-    return { articles: catalog.listPublic().map(({ content, ...article }) => ({ ...article, text: content, custom: false })) };
+    const articles = (await catalog.listPublic()).map(({ content, ...article }) => ({ ...article, text: content, custom: false }));
+    return boundedList(_request, reply, 'articles', articles);
   });
 
   const findChallenge = db.prepare('SELECT * FROM challenges WHERE id=?');
@@ -506,33 +577,25 @@ export async function createApp(options: AppOptions) {
       @mode,@strict,@status,@elapsedMs,@recovered,@recovered,@recoveryHash,@elapsedMs,@claimId,@claimVersion,@requestId,@draftId)
     ON CONFLICT(id) DO NOTHING`);
 
-  function createChallenge(input: {
-    id: string; owner: string; article: NonNullable<ReturnType<typeof catalog.findPublished>>;
+  async function createChallenge(input: {
+    id: string; owner: string; article: NonNullable<Awaited<ReturnType<typeof catalog.findPublished>>>;
     duration: number; mode: PracticeMode; strict: boolean; recoveryHash: string | null; recoveredElapsed?: number;
     claimId?: string; claimVersion?: number; requestId?: string; draftId?: string;
   }) {
     const { article: { content, ...metadata }, strict, recoveredElapsed, claimId, claimVersion, requestId, ...practice } = input;
     const time = now();
     const recovered = recoveredElapsed !== undefined;
-    return insertChallenge.run({
+    return (await insertChallenge.run({
       ...practice, draftId: input.draftId ?? defaultDraftId(input.id), strict: Number(strict), time,
       activeSince: recovered ? null : time, status: recovered ? 'paused' : 'active',
       elapsedMs: recoveredElapsed ?? 0, recovered: Number(recovered), articleId: metadata.id, content,
       claimId: claimId ?? null, claimVersion: claimVersion ?? 0, requestId: requestId ?? null,
       language: metadata.language, difficulty: metadata.difficulty, metadata: JSON.stringify({ ...metadata, custom: false }),
-    }).changes === 1;
+    })).changes === 1;
   }
 
   app.post('/api/tests/start', async (request, reply) => {
-    if (!userFor(request) && !siteSettings.read().settings.guestPracticeEnabled) return reply.code(403).send(guestPracticeDisabled);
-    const expected = expectedAccount(request);
-    if (expected !== undefined) {
-      const user = userFor(request);
-      if (!user && expected !== 'guest') return invalid(reply, '请先登录', 401);
-      if (expected !== (user?.id ?? 'guest')) return invalid(reply, '登录账号已变更', 403);
-    }
     const body = bodyOf(request);
-    const article = catalog.findPublished(body.articleId);
     const duration = Number(body.duration);
     const mode = body.mode === undefined ? 'timed' : body.mode;
     const strict = body.strict === undefined ? false : body.strict;
@@ -545,34 +608,45 @@ export async function createApp(options: AppOptions) {
     if (claimId !== undefined && (typeof claimId !== 'string' || !recoveryIdPattern.test(claimId))) return invalid(reply, '练习租约无效');
     const draftId = body.draftId;
     if (draftId !== undefined && !isDraftId(draftId)) return invalid(reply, '草稿标识无效');
-    if (!article || !isValidDuration(duration)) return invalid(reply, '请选择有效文章和时长');
-    if (body.articleKey !== undefined && body.articleKey !== catalogSnapshotKey({ ...article, text: article.content, custom: false })) {
-      return invalid(reply, '文章已更新，请重新选择', 409);
-    }
+    if (!isValidDuration(duration)) return invalid(reply, '请选择有效文章和时长');
     if (!isPracticeMode(mode) || typeof strict !== 'boolean') return invalid(reply, '练习模式无效');
-    const owner = getOwner(request, reply)!;
-    const id = body.clientId ?? randomUUID();
-    const claimVersion = claimId ? 1 : undefined;
-    const created = createChallenge({ id, owner, article, duration, mode, strict, recoveryHash: key ? digest(key) : null, claimId, claimVersion, draftId });
-    if (!created) return invalid(reply, '练习无法创建', 409);
-    return { id, target: article.content, duration, claimVersion };
+    return db.transaction(async () => {
+      const user = await userFor(request);
+      if (!user && !(await siteSettings.read()).settings.guestPracticeEnabled) return reply.code(403).send(guestPracticeDisabled);
+      const expected = expectedAccount(request);
+      if (expected !== undefined) {
+        if (!user && expected !== 'guest') return invalid(reply, '请先登录', 401);
+        if (expected !== (user?.id ?? 'guest')) return invalid(reply, '登录账号已变更', 403);
+      }
+      const article = await catalog.findPublished(body.articleId);
+      if (!article) return invalid(reply, '请选择有效文章和时长');
+      if (body.articleKey !== undefined && body.articleKey !== catalogSnapshotKey({ ...article, text: article.content, custom: false })) {
+        return invalid(reply, '文章已更新，请重新选择', 409);
+      }
+      const owner = user ? `u:${user.id}` : getGuestOwner(request, reply, true)!;
+      const id = typeof body.clientId === 'string' ? body.clientId : randomUUID();
+      const claimVersion = claimId ? 1 : undefined;
+      const created = await createChallenge({ id, owner, article, duration, mode, strict, recoveryHash: key ? digest(key) : null, claimId, claimVersion, draftId });
+      if (!created) return invalid(reply, '练习无法创建', 409);
+      return { id, target: article.content, duration, claimVersion };
+    })();
   });
 
-  const recoverChallenge = db.transaction((request: FastifyRequest, reply: FastifyReply, input: {
+  const recoverChallenge = db.transaction(async (request: FastifyRequest, reply: FastifyReply, input: {
     id: string; recoveryHash: string | null; articleId: string; articleKey: string | undefined; target: string;
     duration: number; mode: PracticeMode; strict: boolean; elapsedMs: number;
     claim?: RecoveryClaim; draftId?: string; expectedProgressVersion?: number; recoveryMarker?: string;
   }) => {
-    const user = userFor(request);
+    const user = (await userFor(request));
     if (expectedAccount(request) !== (user?.id ?? 'guest')) return undefined;
     const {
       id, recoveryHash, articleId, articleKey, target, duration, mode, strict, claim, draftId, expectedProgressVersion, recoveryMarker,
     } = input;
     const owner = user ? `u:${user.id}` : getGuestOwner(request, reply, true)!;
     const limit = durationMs(input);
-    const existing = findChallenge.get(id) as Challenge | undefined;
+    const existing = (await findChallenge.get(id)) as Challenge | undefined;
     const boundDraftId = existing?.draft_id ?? draftId ?? defaultDraftId(id);
-    const draft = draftFor(owner, boundDraftId);
+    const draft = (await draftFor(owner, boundDraftId));
     const isDraftStale = () => claim && expectedProgressVersion !== undefined && draft &&
       draft.claimVersion === claim.expectedVersion && draft.progressVersion !== null && draft.progressVersion > expectedProgressVersion &&
       (!recoveryMarker || recoveryMarker !== draft.recoveryMarker);
@@ -614,35 +688,35 @@ export async function createApp(options: AppOptions) {
         if (existing.recovery_request_used) {
           return { conflict: { error: '这次恢复已使用', code: 'RECOVERY_ALREADY_USED', currentClaimVersion: existing.claim_version } };
         }
-        if (ownerChanged) db.prepare('UPDATE challenges SET owner=? WHERE id=?').run(owner, id);
+        if (ownerChanged) (await db.prepare('UPDATE challenges SET owner=? WHERE id=?').run(owner, id));
         return result ? settledResponse(result) : paused(existing.elapsed_ms);
       }
       if ((claim?.expectedVersion ?? 0) !== existing.claim_version) return { conflict: practiceTaken };
       if ((!result || draftId !== undefined) && isDraftStale()) return { conflict: draftStale };
       if (result) {
-        db.prepare(`UPDATE challenges SET owner=?, claim_id=?, claim_version=?, recovery_request_id=?, recovery_request_used=0,
+        (await db.prepare(`UPDATE challenges SET owner=?, claim_id=?, claim_version=?, recovery_request_id=?, recovery_request_used=0,
           publish_recovered_at=CASE WHEN published=0 THEN ? ELSE publish_recovered_at END WHERE id=?`)
-          .run(owner, claim?.id ?? null, claimVersion ?? 0, claim?.requestId ?? null, now(), id);
+          .run(owner, claim?.id ?? null, claimVersion ?? 0, claim?.requestId ?? null, now(), id));
         return settledResponse(result);
       }
       if (!mayContinue || existing.published) return undefined;
       if (claim || !existing.recovered || existing.status !== 'paused' || elapsedMs !== existing.elapsed_ms || ownerChanged || !existing.draft_id) {
-        db.prepare(`UPDATE challenges SET owner=?, status='paused', elapsed_ms=?, active_started_at=NULL,
+        (await db.prepare(`UPDATE challenges SET owner=?, status='paused', elapsed_ms=?, active_started_at=NULL,
           pause_count=pause_count+1, recovered=1, recovered_elapsed_ms=?,
           claim_id=?, claim_version=?, recovery_request_id=?, recovery_request_used=0, draft_id=? WHERE id=?`)
-          .run(owner, elapsedMs, elapsedMs, claim?.id ?? null, claimVersion ?? 0, claim?.requestId ?? null, boundDraftId, id);
+          .run(owner, elapsedMs, elapsedMs, claim?.id ?? null, claimVersion ?? 0, claim?.requestId ?? null, boundDraftId, id));
       }
     } else {
-      if (!user && !siteSettings.read().settings.guestPracticeEnabled) return { disabled: true };
-      const article = catalog.findPublished(articleId);
+      if (!user && !(await siteSettings.read()).settings.guestPracticeEnabled) return { disabled: true };
+      const article = (await catalog.findPublished(articleId));
       if (!article || article.content !== target || (articleKey !== undefined &&
         articleKey !== catalogSnapshotKey({ ...article, text: article.content, custom: false }))) return undefined;
       if (draft?.deleted) return { conflict: draftDeleted };
       if (isDraftStale()) return { conflict: draftStale };
-      if (!createChallenge({
+      if (!(await createChallenge({
         id, owner, article, duration, mode, strict, recoveryHash, recoveredElapsed: elapsedMs,
         claimId: claim?.id, claimVersion, requestId: claim?.requestId, draftId: boundDraftId,
-      })) return undefined;
+      }))) return undefined;
     }
     return paused(elapsedMs);
   });
@@ -677,52 +751,53 @@ export async function createApp(options: AppOptions) {
         expectedClaimVersion < 0 || expectedClaimVersion >= Number.MAX_SAFE_INTEGER) return invalid(reply, '练习租约无效');
       claim = { id: claimId, expectedVersion: expectedClaimVersion, requestId: recoveryRequestId };
     }
-    const result = recoverChallenge.immediate(request, reply, {
+    const result = (await recoverChallenge.immediate(request, reply, {
       id, recoveryHash: key ? digest(key) : null, articleId, articleKey, target, duration, mode, strict, elapsedMs, claim, draftId,
       expectedProgressVersion, recoveryMarker,
-    });
+    }));
     if (result && 'disabled' in result) return reply.code(403).send(guestPracticeDisabled);
     if (result && 'conflict' in result) return reply.code(409).send(result.conflict);
     return result ?? invalid(reply, '练习记录不存在', 404);
   });
 
   app.get('/api/tests/:id', async (request, reply) => {
-    const challenge = requireOwnedChallenge(request, reply);
+    const challenge = (await requireOwnedChallenge(request, reply));
     if (!challenge) return reply;
     const result = settledResult(challenge);
     return { status: challenge.status, ...challengeTiming(challenge, now()), duration: challenge.duration, ...(result && { result }) };
   });
 
-  app.post('/api/tests/:id/pause', async (request, reply) => {
-    const challenge = requireOwnedChallenge(request, reply);
+  app.post('/api/tests/:id/pause', async (request, reply) => db.transaction(async () => {
+    const challenge = (await requireOwnedChallenge(request, reply));
     if (!challenge) return reply;
     const time = now();
     if (challenge.status === 'paused') return challengeTiming(challenge, time);
     if (challenge.status !== 'active') return invalid(reply, '这次练习已经结束', 409);
     const elapsed = activeElapsed(challenge, time);
     if (elapsed > durationMs(challenge) + timingGraceMs(challenge)) return invalid(reply, '练习时间已结束', 409);
-    const changed = db.prepare(`UPDATE challenges SET status='paused',elapsed_ms=?,active_started_at=NULL,pause_count=pause_count+1
-      WHERE id=? AND owner=? AND claim_version=? AND status='active' AND active_started_at IS ? AND pause_count=? AND ${draftStillPresent}`)
-      .run(elapsed, challenge.id, challenge.owner, challenge.claim_version, challenge.active_started_at, challenge.pause_count).changes;
-    if (!changed) return challengeChanged(request, reply);
+    const sameActiveStart = db.dialect === 'postgres' ? 'active_started_at IS NOT DISTINCT FROM ?' : 'active_started_at IS ?';
+    const changed = (await db.prepare(`UPDATE challenges SET status='paused',elapsed_ms=?,active_started_at=NULL,pause_count=pause_count+1
+      WHERE id=? AND owner=? AND claim_version=? AND status='active' AND ${sameActiveStart} AND pause_count=? AND ${draftStillPresent}`)
+      .run(elapsed, challenge.id, challenge.owner, challenge.claim_version, challenge.active_started_at, challenge.pause_count)).changes;
+    if (!changed) return (await challengeChanged(request, reply));
     return challengeTiming(challenge, time);
-  });
+  })());
 
-  app.post('/api/tests/:id/resume', async (request, reply) => {
-    const challenge = requireOwnedChallenge(request, reply);
+  app.post('/api/tests/:id/resume', async (request, reply) => db.transaction(async () => {
+    const challenge = (await requireOwnedChallenge(request, reply));
     if (!challenge) return reply;
     if (challenge.status !== 'paused') return invalid(reply, '这次练习未暂停', 409);
     const time = now();
     if (challenge.elapsed_ms > durationMs(challenge) + timingGraceMs(challenge)) return invalid(reply, '练习时间已结束', 409);
-    const changed = db.prepare(`UPDATE challenges SET status='active',active_started_at=?,recovery_request_used=1
+    const changed = (await db.prepare(`UPDATE challenges SET status='active',active_started_at=?,recovery_request_used=1
       WHERE id=? AND owner=? AND claim_version=? AND status='paused' AND pause_count=? AND ${draftStillPresent}`)
-      .run(time, challenge.id, challenge.owner, challenge.claim_version, challenge.pause_count).changes;
-    if (!changed) return challengeChanged(request, reply);
+      .run(time, challenge.id, challenge.owner, challenge.claim_version, challenge.pause_count)).changes;
+    if (!changed) return (await challengeChanged(request, reply));
     return challengeTiming(challenge, time);
-  });
+  })());
 
-  app.post('/api/tests/:id/checkpoint', async (request, reply) => {
-    const challenge = requireOwnedChallenge(request, reply);
+  app.post('/api/tests/:id/checkpoint', async (request, reply) => db.transaction(async () => {
+    const challenge = (await requireOwnedChallenge(request, reply));
     if (!challenge) return reply;
     if (challenge.status !== 'active') return invalid(reply, '这次练习当前无法提交进度', 409);
     const time = now();
@@ -759,18 +834,18 @@ export async function createApp(options: AppOptions) {
     const interval = Math.max(0, Math.min(serverInterval, clientInterval) / 1000);
     const allowance = (challenge.language === 'zh' ? 8 : 32) * interval + 20;
     const flagged = challenge.activity_flag || growth > allowance ? 1 : 0;
-    const changed = db.prepare(`UPDATE challenges SET checkpoints=checkpoints+1,last_checkpoint_at=?,last_checkpoint_elapsed_ms=?,
+    const changed = (await db.prepare(`UPDATE challenges SET checkpoints=checkpoints+1,last_checkpoint_at=?,last_checkpoint_elapsed_ms=?,
       last_client_checkpoint_elapsed_ms=COALESCE(?,last_client_checkpoint_elapsed_ms),
       missing_client_checkpoint_time=MAX(missing_client_checkpoint_time,?),last_correct=?,last_checkpoint_total=?,activity_flag=?
       WHERE id=? AND owner=? AND claim_version=? AND status='active' AND pause_count=? AND checkpoints=? AND ${draftStillPresent}`)
       .run(time, elapsed, clientElapsed, clientElapsed === null ? 1 : 0, correct, total, flagged,
-        challenge.id, challenge.owner, challenge.claim_version, challenge.pause_count, challenge.checkpoints).changes;
-    if (!changed) return challengeChanged(request, reply);
+        challenge.id, challenge.owner, challenge.claim_version, challenge.pause_count, challenge.checkpoints)).changes;
+    if (!changed) return (await challengeChanged(request, reply));
     return { ok: true };
-  });
+  })());
 
-  app.post('/api/tests/:id/finish', async (request, reply) => {
-    const challenge = requireOwnedChallenge(request, reply);
+  app.post('/api/tests/:id/finish', async (request, reply) => db.transaction(async () => {
+    const challenge = (await requireOwnedChallenge(request, reply));
     if (!challenge) return reply;
     const existingResult = settledResult(challenge);
     if (existingResult) return existingResult;
@@ -829,30 +904,31 @@ export async function createApp(options: AppOptions) {
     const staleServerEvidence = lastSampleElapsed === null || serverTail > 10_000;
     const staleClientEvidence = clientTimed && (lastClientElapsed === null || clientTail > 10_000);
     if (minimumCheckpoints > 0 && (staleServerEvidence || staleClientEvidence)) reasons.push('stale_activity');
-    const thresholds = siteSettings.read().settings;
+    const thresholds = (await siteSettings.read()).settings;
     if (challenge.language === 'zh' ? speed > thresholds.reviewThresholdZh : speed > thresholds.reviewThresholdEn) reasons.push('high_speed');
     if (challenge.pause_count > 0) reasons.push('paused_session');
     if (challenge.recovered) reasons.push('recovered_session');
     if (clientTimed && (elapsed - elapsedMs > 3000 || challenge.missing_client_checkpoint_time)) reasons.push('timing_discrepancy');
     const status = reasons.length ? 'review' : 'finished';
-    const changed = db.prepare(`UPDATE challenges SET finished_at=?,status=?,correct=?,total=?,accuracy=?,speed=?,review_reasons=?,elapsed_ms=?,active_started_at=NULL,backspaces=?,errors=?,typed=?,
+    const changed = (await db.prepare(`UPDATE challenges SET finished_at=?,status=?,correct=?,total=?,accuracy=?,speed=?,review_reasons=?,elapsed_ms=?,active_started_at=NULL,backspaces=?,errors=?,typed=?,
       recovery_request_used=1
       WHERE id=? AND owner=? AND claim_version=? AND status=? AND published=0 AND pause_count=? AND checkpoints=? AND ${draftStillPresent}`)
-      .run(time, status, score.correct, score.total, score.accuracy, speed, JSON.stringify(reasons), elapsedMs, backspaces, errors, typed,
-        challenge.id, challenge.owner, challenge.claim_version, challenge.status, challenge.pause_count, challenge.checkpoints).changes;
+      .run(time, status, score.correct, score.total, score.accuracy, speed, JSON.stringify(reasons), elapsedMs, backspaces, errors,
+        db.dialect === 'postgres' ? Buffer.from(typed, 'utf8') : typed,
+        challenge.id, challenge.owner, challenge.claim_version, challenge.status, challenge.pause_count, challenge.checkpoints)).changes;
     if (!changed) {
-      const latest = requireOwnedChallenge(request, reply);
+      const latest = (await requireOwnedChallenge(request, reply));
       if (!latest) return reply;
       const result = settledResult(latest);
       return result ?? invalid(reply, '练习状态已变更', 409);
     }
     const eligible = score.correct > 0 && (challenge.mode !== 'article' || articleComplete);
     return { attemptId: challenge.id, score, status, eligible, elapsedMs };
-  });
+  })());
 
-  const publishScore = db.transaction((attemptId: string, owner: string, nickname: string, maxNicknameLength: number,
+  const publishScore = db.transaction(async (attemptId: string, owner: string, nickname: string, maxNicknameLength: number,
     claimHeader: string | string[] | undefined) => {
-    const challenge = db.prepare('SELECT * FROM challenges WHERE id=? AND owner=?').get(attemptId, owner) as Challenge | undefined;
+    const challenge = (await db.prepare('SELECT * FROM challenges WHERE id=? AND owner=?').get(attemptId, owner)) as Challenge | undefined;
     if (!challenge) return { error: '练习记录不存在', code: 404 } as const;
     if (!claimMatches(challenge, claimHeader)) return { conflict: practiceTaken } as const;
     if (challenge.status === 'rejected' || challenge.ranking_removed) return { conflict: scoreFinalized } as const;
@@ -861,7 +937,7 @@ export async function createApp(options: AppOptions) {
       if (challenge.claim_id) return { status: challenge.status === 'review' ? 'review' : 'ranked' } as const;
       return { error: '这次成绩无法重复提交', code: 409 } as const;
     }
-    if (owner.startsWith('g:') && !siteSettings.read().settings.guestLeaderboardEnabled) return { error: '游客提交排行榜已关闭', code: 403 } as const;
+    if (owner.startsWith('g:') && !(await siteSettings.read()).settings.guestLeaderboardEnabled) return { error: '游客提交排行榜已关闭', code: 403 } as const;
     const nicknameLength = splitCharacters(nickname).length;
     if (nicknameLength < 1 || nicknameLength > maxNicknameLength || /[\p{Cc}\p{Cf}]/u.test(nickname)) {
       return { error: `昵称需为 1–${maxNicknameLength} 个字符`, code: 400 } as const;
@@ -876,28 +952,28 @@ export async function createApp(options: AppOptions) {
     const reasons = recovered
       ? JSON.stringify([...new Set([...JSON.parse(challenge.review_reasons) as string[], 'recovered_session'])])
       : challenge.review_reasons;
-    db.prepare('UPDATE challenges SET nickname=?,published=1,status=?,review_reasons=?,publish_recovered_at=NULL WHERE id=?')
-      .run(nickname, status, reasons, challenge.id);
-    if (status === 'finished' && challenge.mode === 'timed' && !challenge.strict) saveScore({ ...challenge, nickname });
+    (await db.prepare('UPDATE challenges SET nickname=?,published=1,status=?,review_reasons=?,publish_recovered_at=NULL WHERE id=?')
+      .run(nickname, status, reasons, challenge.id));
+    if (status === 'finished' && challenge.mode === 'timed' && !challenge.strict) (await saveScore({ ...challenge, nickname }));
     return { status: status === 'review' ? 'review' : 'ranked' } as const;
   });
 
-  app.post('/api/leaderboard', async (request, reply) => {
+  app.post('/api/leaderboard', async (request, reply) => db.transaction(async () => {
     const body = bodyOf(request);
-    const owner = getOwner(request, reply, false);
+    const owner = (await getOwner(request, reply, false));
     if (typeof body.attemptId !== 'string' || !owner) return invalid(reply, '练习记录不存在', 404);
-    const user = userFor(request);
+    const user = (await userFor(request));
     const nickname = user ? user.username : typeof body.nickname === 'string' ? body.nickname.trim() : '';
     const maxNicknameLength = user ? 24 : 16;
-    const result = publishScore.immediate(body.attemptId, owner, nickname, maxNicknameLength, request.headers['x-practice-claim']);
+    const result = (await publishScore.immediate(body.attemptId, owner, nickname, maxNicknameLength, request.headers['x-practice-claim']));
     if (result.conflict) return reply.code(409).send(result.conflict);
     if (result.detail) return reply.code(result.code).send({ error: result.error, code: result.detail });
     return 'error' in result ? invalid(reply, result.error ?? '提交失败', result.code) : result;
-  });
+  })());
 
   app.get('/api/leaderboard', async (request, reply) => {
     if (expectedAccount(request) !== undefined) {
-      const user = userFor(request);
+      const user = (await userFor(request));
       if (!user) return invalid(reply, '请先登录', 401);
       if (!accountMatches(request, user)) return invalid(reply, '登录账号已变更', 403);
     }
@@ -907,12 +983,12 @@ export async function createApp(options: AppOptions) {
     if (!['zh', 'en'].includes(language) || !difficulties.includes(difficulty as Difficulty) ||
       !['all', 'week', 'month'].includes(period) || !isPracticeMode(mode) || !['true', 'false'].includes(strict) ||
       (mode === 'timed' && !isValidDuration(duration)) ||
-      (articleId !== undefined && !catalog.hasHistorical(articleId, language as Language, difficulty as Difficulty))) {
+      (articleId !== undefined && !(await catalog.hasHistorical(articleId, language as Language, difficulty as Difficulty)))) {
       return invalid(reply, '请选择有效的排行榜');
     }
-    const owner = getOwner(request, reply, false);
+    const owner = (await getOwner(request, reply, false));
     const since = period === 'all' ? 0 : now() - (period === 'week' ? 7 : 30) * 86_400_000;
-    const rows = db.prepare(`
+    const rows = (await db.prepare(`
       WITH candidates AS (
         SELECT id, owner, nickname, speed, accuracy, finished_at, article_id,
           ROW_NUMBER() OVER (PARTITION BY owner ORDER BY speed DESC, accuracy DESC, finished_at, id) AS owner_rank
@@ -932,7 +1008,7 @@ export async function createApp(options: AppOptions) {
     `).all({
       language, difficulty, mode, strict: Number(strict === 'true'), since, owner,
       duration: mode === 'timed' ? duration : null, articleId: articleId ?? null,
-    }) as Array<Omit<RankingEntry, 'articleId'> & { owner: string; total: number; rank: number; articleId: string | null }>;
+    })) as Array<Omit<RankingEntry, 'articleId'> & { owner: string; total: number; rank: number; articleId: string | null }>;
     const entries = rows.map(({ owner: rowOwner, total: _total, articleId, ...row }) => ({
       ...row, ...(articleId && { articleId }), mode, strict: strict === 'true', mine: rowOwner === owner,
     }));
@@ -941,12 +1017,12 @@ export async function createApp(options: AppOptions) {
   });
 
   app.get('/api/history', async (request, reply) => {
-    const user = userFor(request);
+    const user = (await userFor(request));
     if (!user) return invalid(reply, '请先登录', 401);
     if (!accountMatches(request, user)) return invalid(reply, '登录账号已变更', 403);
-    const rows = db.prepare(`SELECT id AS recordId,language,difficulty,duration,correct,total,accuracy,speed,status,elapsed_ms AS elapsedMs,backspaces,errors,
+    const rows = (await db.prepare(`SELECT id AS recordId,language,difficulty,duration,correct,total,accuracy,speed,status,elapsed_ms AS elapsedMs,backspaces,errors,
       finished_at AS finishedAt,article_metadata AS metadata,target,typed,mode,strict
-      FROM challenges WHERE owner=? AND finished_at IS NOT NULL ORDER BY finished_at DESC LIMIT 100`).all(`u:${user.id}`) as Array<{
+      FROM challenges WHERE owner=? AND finished_at IS NOT NULL ORDER BY finished_at DESC LIMIT 100`).all(`u:${user.id}`)) as Array<{
         metadata: string | null; target: string; typed: string | null; mode: PracticeMode; strict: number;
       }>;
     const entries = rows.map(({ metadata, target, typed, mode, strict, ...summary }) => {
@@ -955,7 +1031,7 @@ export async function createApp(options: AppOptions) {
       return { ...summary, article, typed, offset: 0, articleTotal: splitCharacters(target).length, mode, strict: !!strict };
     });
     reply.header('Cache-Control', 'no-store');
-    return { entries };
+    return boundedList(request, reply, 'entries', entries);
   });
 
   if (options.staticRoot && existsSync(options.staticRoot)) {
@@ -966,4 +1042,8 @@ export async function createApp(options: AppOptions) {
     });
   }
   return app;
+  } catch (error) {
+    await db.close();
+    throw error;
+  }
 }

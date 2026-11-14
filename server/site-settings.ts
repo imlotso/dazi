@@ -1,7 +1,7 @@
-import type Database from 'better-sqlite3';
+import type { AsyncDatabase } from './database/types.js';
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
-import type { AdminActor, createAdminAudit } from './admin';
+import type { AdminActor, createAdminAudit } from './admin.js';
 
 const speedThreshold = z.number().int().min(1).max(1000);
 const settingsSchema = z.strictObject({
@@ -34,8 +34,8 @@ function formatValue(value: number | boolean) {
   return typeof value === 'number' ? String(value) : value ? '开启' : '关闭';
 }
 
-export function createSiteSettings(db: Database.Database, audit: ReturnType<typeof createAdminAudit>) {
-  db.exec(`CREATE TABLE IF NOT EXISTS site_settings (
+export async function createSiteSettings(db: AsyncDatabase, audit: ReturnType<typeof createAdminAudit>) {
+  if (db.dialect === 'sqlite') await db.exec(`CREATE TABLE IF NOT EXISTS site_settings (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     settings TEXT NOT NULL,
     revision INTEGER NOT NULL CHECK (revision > 0)
@@ -44,34 +44,34 @@ export function createSiteSettings(db: Database.Database, audit: ReturnType<type
   const save = db.prepare(`INSERT INTO site_settings (id, settings, revision) VALUES (1, ?, ?)
     ON CONFLICT(id) DO UPDATE SET settings=excluded.settings, revision=excluded.revision`);
 
-  function read(): SiteSettingsSnapshot {
-    const row = select.get() as { settings: string; revision: number } | undefined;
+  async function read(): Promise<SiteSettingsSnapshot> {
+    const row = (await select.get()) as { settings: string; revision: number } | undefined;
     return row ? { settings: settingsSchema.parse(JSON.parse(row.settings)), revision: row.revision }
       : { settings: { ...defaults }, revision: 0 };
   }
 
-  const update = db.transaction((actor: AdminActor, { settings, revision }: SiteSettingsSnapshot) => {
-    const previous = read();
+  const update = db.transaction(async (actor: AdminActor, { settings, revision }: SiteSettingsSnapshot) => {
+    const previous = await read();
     if (previous.revision !== revision) return null;
     const changes = fields.filter((key) => previous.settings[key] !== settings[key]);
     if (!changes.length) return previous;
 
     const nextRevision = revision + 1;
-    save.run(JSON.stringify(settings), nextRevision);
+    (await save.run(JSON.stringify(settings), nextRevision));
     const reason = changes.map((key) => `${settingLabels[key]}（${formatValue(previous.settings[key])} → ${formatValue(settings[key])}）`).join('、');
-    audit(actor, 'settings.site.update', 'setting', 'site', '站点设置', reason);
+    await audit(actor, 'settings.site.update', 'setting', 'site', '站点设置', reason);
     return { settings, revision: nextRevision };
   });
 
   return { read, update: update.immediate };
 }
 
-export function registerSiteSettingsRoutes(app: FastifyInstance, store: ReturnType<typeof createSiteSettings>) {
+export function registerSiteSettingsRoutes(app: FastifyInstance, store: Awaited<ReturnType<typeof createSiteSettings>>) {
   app.get('/settings/site', async () => store.read());
   app.post('/settings/site', async (request, reply) => {
     const parsed = updateSchema.safeParse(request.body);
     if (!parsed.success) return reply.code(400).send({ error: '站点设置无效' });
-    const updated = store.update(request.admin, parsed.data);
+    const updated = await store.update(request.admin, parsed.data);
     if (!updated) return reply.code(409).send({ error: '站点设置已更新，请重新加载' });
     return updated;
   });

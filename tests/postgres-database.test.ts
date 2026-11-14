@@ -3,6 +3,7 @@ import { randomBytes } from 'node:crypto';
 import pg from 'pg';
 import { PostgresDatabase } from '../server/postgres/database';
 import { migratePostgres } from '../server/postgres/migrate';
+import { schemaChecksum } from '../server/postgres/schema';
 import { AsyncPostgres } from '../server/database/postgres';
 import { createAsyncWorkspaceStore } from '../server/database/workspace';
 import type { WorkspaceItem } from '../src/lib/models';
@@ -50,6 +51,12 @@ suite('PostgreSQL transactional data layer', () => {
     })).rejects.toThrow('abort');
     expect(Number((await setup.query('SELECT revision FROM site_settings')).rows[0].revision)).toBe(13);
   });
+  it('rejects a schema whose migration checksum does not match the application', async () => {
+    await setup.query("UPDATE dazi_schema_migrations SET checksum='wrong' WHERE version=1");
+    try { await expect(databases[0].verifySchema()).rejects.toThrow(/schema/i); }
+    finally { await setup.query('UPDATE dazi_schema_migrations SET checksum=$1 WHERE version=1', [schemaChecksum]); }
+    await expect(databases[0].verifySchema()).resolves.toBeUndefined();
+  });
 
   it('recovers after a database connection is terminated while idle', async () => {
     const connection = await databases[0].pool.connect();
@@ -59,7 +66,7 @@ suite('PostgreSQL transactional data layer', () => {
     await setup.query('SELECT pg_terminate_backend($1)', [pid]);
     await disconnected;
     await expect(databases[0].verifySchema()).resolves.toBeUndefined();
-    expect(Number((await databases[0].pool.query('SELECT revision FROM site_settings WHERE id=1')).rows[0].revision)).toBe(13);
+    expect((await new AsyncPostgres(databases[0]).prepare('SELECT revision FROM site_settings WHERE id=1').get()).revision).toBe(13);
   });
 
   it('binds existing statement syntax and returns safe integer values through the asynchronous adapter', async () => {
@@ -89,6 +96,27 @@ suite('PostgreSQL transactional data layer', () => {
     expect(await first.get('workspace-user')).toEqual([deleted]);
     expect((await second.pagedSnapshot('workspace-user', undefined, undefined)).items).toEqual([deleted]);
   });
+  it('enforces the full 32 MiB workspace quota atomically across instances', async () => {
+    await setup.query("INSERT INTO users(id,username,email,password_hash,created_at) VALUES ('quota-user','QuotaUser','quota@example.test','hash',1)");
+    await setup.query(`INSERT INTO workspace_items(user_id,kind,item_id,updated_at,value)
+      SELECT 'quota-user','article','existing-'||n,1,'{"text":"'||repeat('字',19900)||'"}' FROM generate_series(1,550) n`);
+    const used = Number((await setup.query("SELECT SUM(octet_length(value)) AS bytes FROM workspace_items WHERE user_id='quota-user'")).rows[0].bytes);
+    const paddingBytes = 32 * 1024 * 1024 - used - 20_000;
+    const prefixSize = Buffer.byteLength(JSON.stringify({ pad: '' }));
+    expect(paddingBytes).toBeGreaterThan(prefixSize);
+    const padding = JSON.stringify({ pad: 'x'.repeat(paddingBytes - prefixSize) });
+    await setup.query("INSERT INTO workspace_items(user_id,kind,item_id,updated_at,value) VALUES ('quota-user','background','light',1,$1)", [padding]);
+    const stores = await Promise.all(databases.map((database) => createAsyncWorkspaceStore(new AsyncPostgres(database))));
+    const item = (id: string): WorkspaceItem => ({ kind: 'article', id, updatedAt: 2, value: {
+      id, title: id, text: 'x'.repeat(15_000), language: 'zh', difficulty: 'beginner', custom: true,
+    } });
+    const results = await Promise.allSettled([stores[0].merge('quota-user', [item('first')]), stores[1].merge('quota-user', [item('second')])]);
+    expect(results.filter((result) => result.status === 'fulfilled')).toHaveLength(1);
+    expect(results.filter((result) => result.status === 'rejected')).toHaveLength(1);
+    const state = await setup.query("SELECT COUNT(*)::int AS count,SUM(octet_length(value)) AS bytes FROM workspace_items WHERE user_id='quota-user'");
+    expect(state.rows[0].count).toBe(552);
+    expect(Number(state.rows[0].bytes)).toBeLessThanOrEqual(32 * 1024 * 1024);
+  }, 20_000);
 });
 
 it('does not silently use a local database when PostgreSQL configuration is missing', () => {

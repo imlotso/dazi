@@ -1,5 +1,5 @@
 // Complete stories from the Project Gutenberg editions linked below.
-import type { Difficulty, Passage } from './articles';
+import type { Difficulty, Passage } from './articles.js';
 
 export const enPassages: Record<Difficulty, Passage[]> = {
   beginner: [

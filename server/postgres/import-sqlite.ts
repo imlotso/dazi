@@ -1,21 +1,27 @@
 import Database from 'better-sqlite3';
 import { createHash, type Hash } from 'node:crypto';
 import type { Client } from 'pg';
-import { assertPostgresTarget, type ExpectedTarget } from './migrate';
-import { dataTables, schemaVersion } from './schema';
+import { assertPostgresTarget, type ExpectedTarget } from './migrate.js';
+import { dataTables, schemaChecksum, schemaVersion } from './schema.js';
+import { decodeEmail, encodeEmail } from '../database/email.js';
 
 type Column = { name: string; type: string; pk: bigint };
 type Row = Record<string, unknown>;
 const quote = (value: string) => `"${value.replaceAll('"', '""')}"`;
 const integer = (column: Column) => /INT/i.test(column.type);
-const normalize = (row: Row, columns: Column[]) => columns.map((column) => {
-  const value = row[column.name];
+const normalize = (row: Row, columns: Column[], table: string, postgres: boolean) => columns.map((column) => {
+  const binaryTyped = table === 'challenges' && column.name === 'typed';
+  const encodedEmail = (table === 'users' || table === 'email_codes') && column.name === 'email';
+  const raw = row[column.name];
+  const value = binaryTyped && Buffer.isBuffer(raw) ? raw.toString('utf8')
+    : encodedEmail && postgres && typeof raw === 'string' ? decodeEmail(raw) : raw;
   if (value === null) return null;
   if (value === undefined || Buffer.isBuffer(value) || typeof value === 'number' && !Number.isFinite(value) ||
-    typeof value === 'string' && value.includes('\0')) throw new Error(`Unsupported value in ${column.name}`);
+    typeof value === 'string' && value.includes('\0') && !binaryTyped && !encodedEmail) throw new Error(`Unsupported value in ${column.name}`);
   return integer(column) ? String(value) : value;
 });
-const updateHash = (hash: Hash, row: Row, columns: Column[]) => hash.update(JSON.stringify(normalize(row, columns)) + '\n');
+const updateHash = (hash: Hash, row: Row, columns: Column[], table: string, postgres = false) =>
+  hash.update(JSON.stringify(normalize(row, columns, table, postgres)) + '\n');
 
 /** Copy an immutable SQLite snapshot into an empty, already migrated target. */
 export async function importSqlite(client: Client, path: string, target: ExpectedTarget) {
@@ -39,8 +45,8 @@ export async function importSqlite(client: Client, path: string, target: Expecte
     transactionStarted = true;
     await assertPostgresTarget(client, target);
     await client.query(`SET LOCAL search_path TO ${quote(target.schema)}, pg_catalog`);
-    const migration = await client.query<{ version: number }>('SELECT version FROM dazi_schema_migrations ORDER BY version');
-    if (migration.rows.length !== 1 || migration.rows[0].version !== schemaVersion) throw new Error('Unsupported PostgreSQL schema version');
+    const migration = await client.query<{ version: number; checksum: string }>('SELECT version,checksum FROM dazi_schema_migrations ORDER BY version');
+    if (migration.rows.length !== 1 || migration.rows[0].version !== schemaVersion || migration.rows[0].checksum !== schemaChecksum) throw new Error('Unsupported PostgreSQL schema version');
     await client.query(`LOCK TABLE ${[...dataTables, 'rate_limit_entries'].map(quote).join(',')} IN ACCESS EXCLUSIVE MODE`);
     for (const table of dataTables) {
       const result = await client.query(`SELECT 1 FROM ${quote(table)} LIMIT 1`);
@@ -65,6 +71,7 @@ export async function importSqlite(client: Client, path: string, target: Expecte
       const names = columns.map(({ name }) => quote(name)).join(',');
       const source = sqlite.prepare(`SELECT ${names} FROM ${quote(table)} ORDER BY ${sqliteOrder}`).iterate() as Iterable<Row>;
       const sourceHash = createHash('sha256');
+      const sourceEmailRows: string[] = [];
       let count = 0;
       let batch: unknown[][] = [];
       let batchBytes = 0;
@@ -76,23 +83,32 @@ export async function importSqlite(client: Client, path: string, target: Expecte
         batch = []; batchBytes = 0;
       }
       for (const row of source) {
-        updateHash(sourceHash, row, columns);
-        const values = columns.map(({ name }) => typeof row[name] === 'bigint' ? String(row[name]) : row[name]);
+        if (table === 'email_codes') sourceEmailRows.push(createHash('sha256').update(JSON.stringify(normalize(row, columns, table, false))).digest('hex'));
+        else updateHash(sourceHash, row, columns, table);
+        const values = columns.map(({ name }) => table === 'challenges' && name === 'typed' && typeof row[name] === 'string'
+          ? Buffer.from(row[name] as string, 'utf8')
+          : (table === 'users' || table === 'email_codes') && name === 'email' && typeof row[name] === 'string'
+            ? encodeEmail(row[name] as string) : typeof row[name] === 'bigint' ? String(row[name]) : row[name]);
         const bytes = Buffer.byteLength(JSON.stringify(values));
         if (batch.length && (batch.length >= 100 || batchBytes + bytes > 1024 * 1024)) await flush();
         batch.push(values); batchBytes += bytes; count++;
       }
       await flush();
-      const expected = sourceHash.digest('hex');
+      const expected = table === 'email_codes' ? createHash('sha256').update(sourceEmailRows.sort().join('')).digest('hex') : sourceHash.digest('hex');
       const actual = createHash('sha256');
+      const targetEmailRows: string[] = [];
       let received = 0;
       for (;;) {
         const page = await client.query<Row>(`SELECT ${names} FROM ${quote(table)} ORDER BY ${pgOrder} LIMIT 100 OFFSET $1`, [received]);
-        for (const row of page.rows) updateHash(actual, row, columns);
+        for (const row of page.rows) {
+          if (table === 'email_codes') targetEmailRows.push(createHash('sha256').update(JSON.stringify(normalize(row, columns, table, true))).digest('hex'));
+          else updateHash(actual, row, columns, table, true);
+        }
         received += page.rows.length;
         if (page.rows.length < 100) break;
       }
-      if (received !== count || actual.digest('hex') !== expected) throw new Error(`Imported data did not verify for ${table}`);
+      const targetHash = table === 'email_codes' ? createHash('sha256').update(targetEmailRows.sort().join('')).digest('hex') : actual.digest('hex');
+      if (received !== count || targetHash !== expected) throw new Error(`Imported data did not verify for ${table}`);
       counts[table] = count;
     }
     const sequence = sqlite.prepare("SELECT seq FROM sqlite_sequence WHERE name='admin_audit'").get() as { seq: bigint } | undefined;

@@ -1,7 +1,8 @@
-import type Database from 'better-sqlite3';
+import type { AsyncDatabase } from './database/types.js';
+import { encodeEmail } from './database/email.js';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
-import { difficulties, type Difficulty, type Language } from '../src/data/articles';
+import { difficulties, type Difficulty, type Language } from '../src/data/articles.js';
 
 export type AdminActor = { id: string; username: string; authVersion: number };
 type TargetType = 'user' | 'article' | 'score' | 'setting';
@@ -47,53 +48,53 @@ const accountFields = "id,username,email,role,CASE WHEN disabled_at IS NULL THEN
 const auditFields = 'id,actor_id AS actorId,actor_name AS actorName,action,target_type AS targetType,target_id AS targetId,target_label AS targetLabel,reason,created_at AS createdAt';
 const scoreState = "CASE WHEN status='review' THEN 'pending' WHEN status='rejected' THEN 'rejected' WHEN ranking_removed=1 THEN 'removed' ELSE 'published' END";
 
-export function migrateAdministration(db: Database.Database, adminEmail: string) {
-  db.transaction(() => {
-    const columns = new Set((db.pragma('table_info(users)') as Array<{ name: string }>).map((column) => column.name));
+export async function migrateAdministration(db: AsyncDatabase, adminEmail: string) {
+  await db.transaction(async () => {
+    const columns = new Set(((await db.pragma('table_info(users)')) as Array<{ name: string }>).map((column) => column.name));
     if (!columns.has('role')) {
-      db.exec("ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'user' CHECK (role IN ('user','admin'))");
+      (await db.exec("ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'user' CHECK (role IN ('user','admin'))"));
     }
-    if (!columns.has('disabled_at')) db.exec('ALTER TABLE users ADD COLUMN disabled_at INTEGER');
-    if (!columns.has('auth_version')) db.exec('ALTER TABLE users ADD COLUMN auth_version INTEGER NOT NULL DEFAULT 0');
-    if (adminEmail && !db.prepare("SELECT 1 FROM users WHERE role='admin' LIMIT 1").get()) {
-      const promoted = db.prepare("UPDATE users SET role='admin',auth_version=auth_version+1 WHERE email=? AND disabled_at IS NULL RETURNING id")
-        .get(adminEmail) as { id: string } | undefined;
+    if (!columns.has('disabled_at')) (await db.exec('ALTER TABLE users ADD COLUMN disabled_at INTEGER'));
+    if (!columns.has('auth_version')) (await db.exec('ALTER TABLE users ADD COLUMN auth_version INTEGER NOT NULL DEFAULT 0'));
+    if (adminEmail && !(await db.prepare("SELECT 1 FROM users WHERE role='admin' LIMIT 1").get())) {
+      const promoted = (await db.prepare("UPDATE users SET role='admin',auth_version=auth_version+1 WHERE email=? AND disabled_at IS NULL RETURNING id")
+        .get(adminEmail)) as { id: string } | undefined;
       if (promoted) {
-        db.prepare('DELETE FROM sessions WHERE user_id=?').run(promoted.id);
-        db.prepare('DELETE FROM email_codes WHERE email=?').run(adminEmail);
+        (await db.prepare('DELETE FROM sessions WHERE user_id=?').run(promoted.id));
+        (await db.prepare('DELETE FROM email_codes WHERE email=?').run(adminEmail));
       }
     }
-    const oldAudit = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='admin_audit'").get() as { sql: string } | undefined;
+    const oldAudit = (await db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='admin_audit'").get()) as { sql: string } | undefined;
     const migrateAuditTargets = oldAudit && !oldAudit.sql.includes("'setting'");
-    if (migrateAuditTargets) db.exec('ALTER TABLE admin_audit RENAME TO admin_audit_legacy');
-    db.exec(`
+    if (migrateAuditTargets) (await db.exec('ALTER TABLE admin_audit RENAME TO admin_audit_legacy'));
+    (await db.exec(`
       CREATE TABLE IF NOT EXISTS admin_audit (
         id INTEGER PRIMARY KEY AUTOINCREMENT, actor_id TEXT NOT NULL, actor_name TEXT NOT NULL,
         action TEXT NOT NULL, target_type TEXT NOT NULL CHECK (target_type IN ('user','article','score','setting')),
         target_id TEXT NOT NULL, target_label TEXT NOT NULL, reason TEXT, created_at INTEGER NOT NULL
       );
-    `);
+    `));
     if (migrateAuditTargets) {
-      db.exec(`INSERT INTO admin_audit SELECT * FROM admin_audit_legacy;
-        DROP TABLE admin_audit_legacy;`);
+      (await db.exec(`INSERT INTO admin_audit SELECT * FROM admin_audit_legacy;
+        DROP TABLE admin_audit_legacy;`));
     }
-    db.exec(`
+    (await db.exec(`
       CREATE INDEX IF NOT EXISTS admin_audit_target ON admin_audit(target_type,id DESC);
       CREATE INDEX IF NOT EXISTS sessions_user ON sessions(user_id);
       CREATE INDEX IF NOT EXISTS challenges_admin_scores ON challenges(finished_at DESC,id) WHERE published=1;
       CREATE INDEX IF NOT EXISTS challenges_recent_finished ON challenges(finished_at,owner) WHERE finished_at IS NOT NULL;
-    `);
+    `));
   }).immediate();
 }
 
-export function createAdminAudit(db: Database.Database, now: () => number) {
+export function createAdminAudit(db: AsyncDatabase, now: () => number) {
   const insert = db.prepare('INSERT INTO admin_audit(actor_id,actor_name,action,target_type,target_id,target_label,reason,created_at) VALUES (?,?,?,?,?,?,?,?)');
   const authorized = db.prepare("SELECT 1 FROM users WHERE id=? AND role='admin' AND disabled_at IS NULL AND auth_version=?");
-  return (actor: AdminActor, action: string, targetType: TargetType, targetId: string, targetLabel: string, reason: string | null) => {
-    if (!authorized.get(actor.id, actor.authVersion)) {
+  return async (actor: AdminActor, action: string, targetType: TargetType, targetId: string, targetLabel: string, reason: string | null) => {
+    if (!(await authorized.get(actor.id, actor.authVersion))) {
       throw new AdminAccessError();
     }
-    insert.run(actor.id, actor.username, action, targetType, targetId, targetLabel, reason, now());
+    (await insert.run(actor.id, actor.username, action, targetType, targetId, targetLabel, reason, now()));
   };
 }
 
@@ -104,18 +105,18 @@ type RankableChallenge = {
 };
 
 type Options = {
-  db: Database.Database;
+  db: AsyncDatabase;
   now: () => number;
-  publishedArticleCount: () => number;
+  publishedArticleCount: () => Promise<number>;
   audit: ReturnType<typeof createAdminAudit>;
-  saveScore: (challenge: RankableChallenge) => void;
+  saveScore: (challenge: RankableChallenge) => Promise<void>;
 };
 
-function listPage(db: Database.Database, query: PageQuery, from: string, fields: string, order: string, values: SqlValues) {
-  const total = (db.prepare(`SELECT COUNT(*) AS count ${from}`).get(values) as Count).count;
-  const entries = db.prepare(`SELECT ${fields} ${from} ORDER BY ${order} LIMIT @limit OFFSET @offset`).all({
+async function listPage(db: AsyncDatabase, query: PageQuery, from: string, fields: string, order: string, values: SqlValues) {
+  const total = ((await db.prepare(`SELECT COUNT(*) AS count ${from}`).get(values)) as Count).count;
+  const entries = (await db.prepare(`SELECT ${fields} ${from} ORDER BY ${order} LIMIT @limit OFFSET @offset`).all({
     ...values, limit: query.pageSize, offset: (query.page - 1) * query.pageSize,
-  });
+  }));
   return { entries, total, page: query.page, pageSize: query.pageSize };
 }
 
@@ -151,33 +152,33 @@ export function registerAdminRoutes(app: FastifyInstance, { db, now, publishedAr
   const invalidateAuth = db.prepare('UPDATE users SET auth_version=auth_version+1 WHERE id=?');
   const revokeCodes = db.prepare('DELETE FROM email_codes WHERE email=?');
 
-  const changeAccount = db.transaction((actor: AdminActor, id: string, change: z.output<typeof accountRole> | z.output<typeof accountStatus>) => {
-    const user = findUser.get(id) as UserSummary | undefined;
+  const changeAccount = db.transaction(async (actor: AdminActor, id: string, change: z.output<typeof accountRole> | z.output<typeof accountStatus>) => {
+    const user = (await findUser.get(id)) as UserSummary | undefined;
     if (!user) return { error: '账号不存在', status: 404 } as const;
     const disabling = 'status' in change && change.status === 'disabled';
     const demoting = 'role' in change && change.role === 'user';
     if ((disabling || demoting) && actor.id === id) return { error: '无法停用自己的账号或撤销自己的管理权限', status: 409 } as const;
-    if ((disabling || demoting) && user.role === 'admin' && user.status === 'active' && (activeAdmins.get() as Count).count <= 1) {
+    if ((disabling || demoting) && user.role === 'admin' && user.status === 'active' && ((await activeAdmins.get()) as Count).count <= 1) {
       return { error: '至少保留一个启用的管理员账号', status: 409 } as const;
     }
     if ('role' in change && change.role === 'admin' && user.status === 'disabled') return { error: '请先启用账号', status: 409 } as const;
     const unchanged = 'role' in change ? change.role === user.role : change.status === user.status;
     if (unchanged) return { error: '账号状态已变更，请刷新后重试', status: 409 } as const;
     if ('status' in change) {
-      setStatus.run(disabling ? now() : null, id);
-      audit(actor, disabling ? 'user.disable' : 'user.enable', 'user', id, user.username, change.reason);
+      (await setStatus.run(disabling ? now() : null, id));
+      await audit(actor, disabling ? 'user.disable' : 'user.enable', 'user', id, user.username, change.reason);
     } else {
-      setRole.run(change.role, id);
-      audit(actor, demoting ? 'user.demote' : 'user.promote', 'user', id, user.username, change.reason);
+      (await setRole.run(change.role, id));
+      await audit(actor, demoting ? 'user.demote' : 'user.promote', 'user', id, user.username, change.reason);
     }
-    revoke.run(id);
-    revokeCodes.run(user.email);
+    (await revoke.run(id));
+    (await revokeCodes.run(db.dialect === 'postgres' ? encodeEmail(user.email) : user.email));
     return { ok: true } as const;
   });
 
   app.get('/overview', async () => ({
-    metrics: { ...summary.get({ since: now() - 7 * 86_400_000 }) as object, publishedArticles: publishedArticleCount() },
-    recentActions: auditRecent.all(),
+    metrics: { ...(await summary.get({ since: now() - 7 * 86_400_000 })) as object, publishedArticles: await publishedArticleCount() },
+    recentActions: (await auditRecent.all()),
   }));
 
   app.get('/users', async (request, reply) => {
@@ -192,58 +193,60 @@ export function registerAdminRoutes(app: FastifyInstance, { db, now, publishedAr
   });
 
   app.get<{ Params: { id: string } }>('/users/:id', async (request, reply) => {
-    const user = findUser.get(request.params.id) as UserSummary | undefined;
+    const user = (await findUser.get(request.params.id)) as UserSummary | undefined;
     if (!user) return invalid(reply, '账号不存在', 404);
-    const counts = readAccountCounts.get({ id: user.id, owner: 'u:' + user.id, now: now() }) as object;
+    const counts = (await readAccountCounts.get({ id: user.id, owner: 'u:' + user.id, now: now() })) as object;
     return { user: { ...user, ...counts } };
   });
 
   app.post<{ Params: { id: string } }>('/users/:id/status', async (request, reply) => {
     const parsed = accountStatus.safeParse(request.body);
     if (!parsed.success) return invalid(reply, '请选择有效状态并填写原因');
-    const result = changeAccount.immediate(request.admin, request.params.id, parsed.data);
+    const result = await changeAccount.immediate(request.admin, request.params.id, parsed.data);
     return 'error' in result ? invalid(reply, result.error ?? '操作未完成', result.status) : result;
   });
 
   app.post<{ Params: { id: string } }>('/users/:id/role', async (request, reply) => {
     const parsed = accountRole.safeParse(request.body);
     if (!parsed.success) return invalid(reply, '请选择有效角色并填写原因');
-    const result = changeAccount.immediate(request.admin, request.params.id, parsed.data);
+    const result = await changeAccount.immediate(request.admin, request.params.id, parsed.data);
     return 'error' in result ? invalid(reply, result.error ?? '操作未完成', result.status) : result;
   });
 
-  const revokeAccountSessions = db.transaction((actor: AdminActor, id: string, reason: string) => {
-    const user = findUser.get(id) as UserSummary | undefined;
+  const revokeAccountSessions = db.transaction(async (actor: AdminActor, id: string, reason: string) => {
+    const user = (await findUser.get(id)) as UserSummary | undefined;
     if (!user) return { error: '账号不存在', status: 404 } as const;
     if (actor.id === id) return { error: '请从账号菜单退出登录', status: 409 } as const;
-    invalidateAuth.run(id);
-    revoke.run(id);
-    revokeCodes.run(user.email);
-    audit(actor, 'user.revoke_sessions', 'user', id, user.username, reason);
+    (await invalidateAuth.run(id));
+    (await revoke.run(id));
+    (await revokeCodes.run(db.dialect === 'postgres' ? encodeEmail(user.email) : user.email));
+    await audit(actor, 'user.revoke_sessions', 'user', id, user.username, reason);
     return { ok: true } as const;
   });
 
   app.post<{ Params: { id: string } }>('/users/:id/sessions/revoke', async (request, reply) => {
     const parsed = z.strictObject({ reason: reasonField }).safeParse(request.body);
     if (!parsed.success) return invalid(reply, '请填写退出会话原因');
-    const result = revokeAccountSessions.immediate(request.admin, request.params.id, parsed.data.reason);
+    const result = await revokeAccountSessions.immediate(request.admin, request.params.id, parsed.data.reason);
     return 'error' in result ? invalid(reply, result.error ?? '操作未完成', result.status) : result;
   });
 
+  const articleTitle = db.dialect === 'postgres' ? 'dazi_json_title(article_metadata)'
+    : "CASE WHEN json_valid(article_metadata) THEN json_extract(article_metadata,'$.title') END";
   const scoreFields = `id,nickname,language,difficulty,article_id AS articleId,duration,mode,strict,speed,accuracy,
     checkpoints,review_reasons AS reviewReasons,finished_at AS finishedAt,${scoreState} AS status,
-    CASE WHEN json_valid(article_metadata) THEN json_extract(article_metadata,'$.title') END AS articleTitle`;
+    ${articleTitle} AS articleTitle`;
   const scoreScope = "published=1 AND status IN ('review','finished','rejected') AND nickname IS NOT NULL AND finished_at IS NOT NULL";
 
   app.get('/scores', async (request, reply) => {
     const parsed = scoreQuery.safeParse(request.query);
     if (!parsed.success) return invalid(reply, '成绩筛选条件无效');
     const query = parsed.data;
-    const page = listPage(db, query, `FROM challenges WHERE ${scoreScope}
+    const page = await listPage(db, query, `FROM challenges WHERE ${scoreScope}
       AND (@status IS NULL OR ${scoreState}=@status) AND (@language IS NULL OR language=@language)
       AND (@difficulty IS NULL OR difficulty=@difficulty)
       AND (@q='' OR instr(lower(nickname),lower(@q))>0 OR id=@q OR article_id=@q
-        OR instr(lower(CASE WHEN json_valid(article_metadata) THEN json_extract(article_metadata,'$.title') END),lower(@q))>0)`,
+        OR instr(lower(${articleTitle}),lower(@q))>0)`,
     scoreFields, 'finished_at DESC,id', {
       status: query.status ?? null, language: query.language ?? null, difficulty: query.difficulty ?? null, q: query.q,
     });
@@ -257,8 +260,8 @@ export function registerAdminRoutes(app: FastifyInstance, { db, now, publishedAr
   const setScoreStatus = db.prepare('UPDATE challenges SET status=? WHERE id=?');
   const flagRemoved = db.prepare('UPDATE challenges SET ranking_removed=1 WHERE id=?');
   const deleteScore = db.prepare('DELETE FROM scores WHERE attempt_id=?');
-  const moderateScores = db.transaction((actor: AdminActor, { ids, action, reason }: z.output<typeof moderation>) => {
-    const entries = ids.map((id) => findScore.get(id) as RankableChallenge | undefined);
+  const moderateScores = db.transaction(async (actor: AdminActor, { ids, action, reason }: z.output<typeof moderation>) => {
+    const entries = await Promise.all(ids.map(async (id) => (await findScore.get(id)) as RankableChallenge | undefined));
     if (entries.some((entry) => !entry)) return { error: '成绩不存在，请刷新后重试', status: 404 } as const;
     for (const entry of entries as RankableChallenge[]) {
       const allowed = action === 'remove' ? entry.status === 'finished' && !entry.ranking_removed : entry.status === 'review';
@@ -266,28 +269,28 @@ export function registerAdminRoutes(app: FastifyInstance, { db, now, publishedAr
     }
     for (const entry of entries as RankableChallenge[]) {
       if (action === 'remove') {
-        flagRemoved.run(entry.id);
-        deleteScore.run(entry.id);
+        (await flagRemoved.run(entry.id));
+        (await deleteScore.run(entry.id));
       } else {
-        setScoreStatus.run(action === 'approve' ? 'finished' : 'rejected', entry.id);
-        if (action === 'approve' && entry.mode === 'timed' && !entry.strict) saveScore(entry);
+        (await setScoreStatus.run(action === 'approve' ? 'finished' : 'rejected', entry.id));
+        if (action === 'approve' && entry.mode === 'timed' && !entry.strict) await saveScore(entry);
       }
-      audit(actor, `score.${action}`, 'score', entry.id, entry.nickname, reason);
+      await audit(actor, `score.${action}`, 'score', entry.id, entry.nickname, reason);
     }
     return { ok: true, count: entries.length } as const;
   });
 
-  function moderate(request: FastifyRequest, reply: FastifyReply, body: unknown) {
+  async function moderate(request: FastifyRequest, reply: FastifyReply, body: unknown) {
     const parsed = moderation.safeParse(body);
     if (!parsed.success) return invalid(reply, '请选择有效成绩并填写原因');
-    const result = moderateScores.immediate(request.admin, parsed.data);
+    const result = await moderateScores.immediate(request.admin, parsed.data);
     return 'error' in result ? invalid(reply, result.error ?? '操作未完成', result.status) : result;
   }
 
   app.post('/scores/moderate', async (request, reply) => moderate(request, reply, request.body));
   app.get('/review', async () => {
-    const rows = db.prepare(`SELECT id,nickname,language,difficulty,duration,speed,accuracy,checkpoints,review_reasons AS reviewReasons,finished_at AS finishedAt
-      FROM challenges WHERE ${scoreScope} AND status='review' ORDER BY finished_at DESC,id LIMIT 100`).all() as Array<{ reviewReasons: string }>;
+    const rows = (await db.prepare(`SELECT id,nickname,language,difficulty,duration,speed,accuracy,checkpoints,review_reasons AS reviewReasons,finished_at AS finishedAt
+      FROM challenges WHERE ${scoreScope} AND status='review' ORDER BY finished_at DESC,id LIMIT 100`).all()) as Array<{ reviewReasons: string }>;
     return { entries: rows.map(({ reviewReasons, ...row }) => ({ ...row, reasons: decodeReasons(reviewReasons) })) };
   });
   app.post<{ Params: { id: string } }>('/review/:id', async (request, reply) => {

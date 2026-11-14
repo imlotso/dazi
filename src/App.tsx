@@ -32,7 +32,7 @@ import { StatsView } from './components/StatsView';
 import { articles, type Difficulty, type Language } from './data/articles';
 import { continuationDraftId, discardSavedDraft, draftAwaitingStart, localHistory, practiceDraftId, readDraft, readDrafts, savedPracticeFromLegacy, usePractice, type PracticeDraft } from './hooks/usePractice';
 import { useWorkspace } from './hooks/useWorkspace';
-import { api, ApiError, type User } from './lib/api';
+import { api, apiPages, ApiError, type User } from './lib/api';
 import { catalogSnapshotKey, compareDraftProgress, sameDraftSnapshot, staleDraftBase, type ArticleSnapshot, type PracticeRecord, type ReaderSettings, type SavedPractice } from './lib/models';
 import { readableCharacter } from './lib/practice-lines';
 import { scoreTyping, splitCharacters } from './lib/scoring';
@@ -234,7 +234,7 @@ function PracticeApp({ user, authReady, onUser, onAdministration }: { user: User
 
   useEffect(() => {
     const controller = new AbortController();
-    void api<{ articles: ArticleSnapshot[] }>('/api/articles', { signal: controller.signal }).then(({ articles: published }) => {
+    void apiPages<ArticleSnapshot>('/api/articles', 'articles', { signal: controller.signal }).then((published) => {
       if (controller.signal.aborted || !Array.isArray(published) || !published.length) return;
       setPublicArticles(published);
       if (!interacted.current) setSelection((current) => current === builtIns[0] ? published[0] : current);
@@ -291,7 +291,7 @@ function PracticeApp({ user, authReady, onUser, onAdministration }: { user: User
     if (!ownerId || !recordViews.includes(view)) return;
     const controller = new AbortController();
     setHistoryError(false);
-    api<{ entries: PracticeRecord[] }>('/api/history', { signal: controller.signal, headers: { 'X-Workspace-Owner': ownerId } }).then(({ entries }) => {
+    apiPages<PracticeRecord>('/api/history', 'entries', { signal: controller.signal, headers: { 'X-Workspace-Owner': ownerId } }).then((entries) => {
       if (!controller.signal.aborted && Array.isArray(entries)) setRemoteHistory(entries);
     }).catch(() => {
       if (!controller.signal.aborted) { setRemoteHistory([]); setHistoryError(true); }

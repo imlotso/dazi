@@ -1,4 +1,4 @@
-import { splitCharacters } from './scoring';
+import { splitCharacters } from './scoring.js';
 
 export type PracticeLine = { text: string; characters: string[]; start: number; end: number };
 

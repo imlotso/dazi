@@ -46,4 +46,25 @@ export async function api<T>(path: string, options?: { method?: 'GET' | 'POST'; 
   }
 }
 
+/** Collect a whole bounded list before the caller replaces any visible data. */
+export async function apiPages<T>(path: string, field: 'articles' | 'entries', options?: { signal?: AbortSignal; headers?: HeadersInit }): Promise<T[]> {
+  const result: T[] = [];
+  const seen = new Set<string>();
+  let cursor: string | undefined;
+  do {
+    const headers = new Headers(options?.headers);
+    headers.set('X-List-Paged', '1');
+    if (cursor) headers.set('X-List-Cursor', cursor);
+    const page = await api<Record<string, unknown>>(path, { signal: options?.signal, headers });
+    if (!Array.isArray(page[field])) throw new Error('服务返回的数据无法读取');
+    result.push(...page[field] as T[]);
+    const next = page.nextCursor;
+    if (next !== undefined && next !== null && (typeof next !== 'string' || !next || next.length > 2048)) throw new Error('服务返回的数据无法读取');
+    cursor = typeof next === 'string' ? next : undefined;
+    if (cursor && (seen.has(cursor) || seen.size >= 2000)) throw new Error('服务返回的数据无法读取');
+    if (cursor) seen.add(cursor);
+  } while (cursor);
+  return result;
+}
+
 export type User = { id: string; username: string; email: string; isAdmin: boolean };

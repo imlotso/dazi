@@ -1,6 +1,6 @@
-import type { Language } from '../data/articles';
-import { snapshotKey, type ArticleSnapshot, type MistakeEntry, type MistakeSample, type PracticeRecord } from './models';
-import { splitCharacters } from './scoring';
+import type { Language } from '../data/articles.js';
+import { snapshotKey, type ArticleSnapshot, type MistakeEntry, type MistakeSample, type PracticeRecord } from './models.js';
+import { splitCharacters } from './scoring.js';
 
 export const MAX_PRIVATE_CHARACTERS = 20_000;
 export const MAX_PRIVATE_BYTES = 100_000;

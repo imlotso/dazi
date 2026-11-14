@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto';
+
 /** PostgreSQL schema 1: deliberately applied only by the operator migration. */
 export const schemaVersion = 1;
 export const schemaSql = `
@@ -8,7 +10,17 @@ CREATE TABLE users (
 );
 -- SQLite NOCASE folds ASCII only. C collation keeps all other characters distinct.
 CREATE UNIQUE INDEX users_username_nocase ON users ((translate(username,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz') COLLATE "C"));
-CREATE UNIQUE INDEX users_email_nocase ON users ((translate(email,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz') COLLATE "C"));
+CREATE FUNCTION dazi_email_key(value TEXT) RETURNS TEXT LANGUAGE plpgsql IMMUTABLE STRICT AS $$
+DECLARE raw BYTEA; nul INTEGER; head TEXT;
+BEGIN
+  IF left(value,12)='~dazi-email~' THEN raw := decode(substr(value,13),'base64');
+  ELSE raw := convert_to(value,'UTF8'); END IF;
+  nul := position(decode('00','hex') IN raw);
+  IF nul>0 THEN head := convert_from(substring(raw FROM 1 FOR nul-1),'UTF8');
+  ELSE head := convert_from(raw,'UTF8'); END IF;
+  RETURN encode(convert_to(translate(head,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'UTF8'),'hex') || ':' || octet_length(raw)::text;
+END $$;
+CREATE UNIQUE INDEX users_email_nocase ON users (dazi_email_key(email));
 CREATE TABLE sessions (
   token_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, expires_at BIGINT NOT NULL
 );
@@ -26,7 +38,7 @@ CREATE TABLE challenges (
   pause_count BIGINT NOT NULL DEFAULT 0, last_checkpoint_elapsed_ms BIGINT, last_client_checkpoint_elapsed_ms BIGINT,
   missing_client_checkpoint_time BIGINT NOT NULL DEFAULT 0, last_checkpoint_total BIGINT NOT NULL DEFAULT 0,
   backspaces BIGINT NOT NULL DEFAULT 0, errors BIGINT NOT NULL DEFAULT 0, article_id TEXT, article_metadata TEXT,
-  typed TEXT, mode TEXT NOT NULL DEFAULT 'timed', strict BIGINT NOT NULL DEFAULT 0, ranking_removed BIGINT NOT NULL DEFAULT 0,
+  typed BYTEA, mode TEXT NOT NULL DEFAULT 'timed', strict BIGINT NOT NULL DEFAULT 0, ranking_removed BIGINT NOT NULL DEFAULT 0,
   recovery_key_hash TEXT, recovered BIGINT NOT NULL DEFAULT 0, claim_id TEXT, claim_version BIGINT NOT NULL DEFAULT 0,
   recovery_request_id TEXT, recovery_request_used BIGINT NOT NULL DEFAULT 0, recovered_elapsed_ms BIGINT NOT NULL DEFAULT 0,
   publish_recovered_at BIGINT, draft_id TEXT
@@ -69,6 +81,28 @@ CREATE TABLE rate_limit_entries (
   key TEXT PRIMARY KEY, count BIGINT NOT NULL, expires_at TIMESTAMPTZ NOT NULL
 );
 CREATE INDEX rate_limit_expiry ON rate_limit_entries(expires_at);
+-- PostgreSQL JSON extraction cannot materialize an escaped NUL anywhere in a
+-- document. Replace only genuine NUL escapes while parsing this display field;
+-- the original historical metadata stays byte-for-byte unchanged as TEXT.
+CREATE FUNCTION dazi_json_title(source TEXT) RETURNS TEXT LANGUAGE plpgsql IMMUTABLE AS $$
+DECLARE result TEXT := ''; i INTEGER := 1; inside BOOLEAN := FALSE; ch TEXT;
+BEGIN
+  IF source IS NULL THEN RETURN NULL; END IF;
+  IF position(chr(92) || 'u0000' IN source)=0 THEN RETURN (source::json ->> 'title'); END IF;
+  WHILE i <= length(source) LOOP
+    ch := substr(source,i,1);
+    IF inside AND ch=chr(92) THEN
+      IF substr(source,i+1,5)='u0000' THEN result := result || chr(92) || 'uFFFD'; i := i+6;
+      ELSE result := result || substr(source,i,2); i := i+2; END IF;
+    ELSE
+      result := result || ch;
+      IF ch='"' THEN inside := NOT inside; END IF;
+      i := i+1;
+    END IF;
+  END LOOP;
+  RETURN (result::json ->> 'title');
+EXCEPTION WHEN OTHERS THEN RETURN NULL;
+END $$;
 CREATE INDEX scores_rank ON scores(language,difficulty,duration,speed DESC,accuracy DESC,created_at ASC);
 CREATE INDEX challenges_owner ON challenges(owner,started_at DESC);
 CREATE INDEX challenges_rank ON challenges(language,difficulty,mode,strict,finished_at)
@@ -85,3 +119,4 @@ export const dataTables = [
   'users', 'sessions', 'email_codes', 'challenges', 'scores', 'workspace_items', 'workspace_revisions',
   'public_articles', 'public_article_groups', 'admin_audit', 'site_settings', 'smtp_settings',
 ] as const;
+export const schemaChecksum = createHash('sha256').update(schemaSql).digest('hex');

@@ -1,5 +1,5 @@
-import { zhPassages } from './zh-library';
-import { enPassages } from './en-library';
+import { zhPassages } from './zh-library.js';
+import { enPassages } from './en-library.js';
 
 export const difficulties = ['beginner', 'intermediate', 'advanced'] as const;
 export type Difficulty = typeof difficulties[number];

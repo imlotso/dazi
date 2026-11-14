@@ -1,6 +1,6 @@
-import { defaultSettings, type ReaderSettings, type WorkspaceItem, type WorkspaceKind, type WorkspaceValues } from './models';
-import { themeStorageKey } from './theme';
-import { isBackgroundConfig } from './background';
+import { defaultSettings, type ReaderSettings, type WorkspaceItem, type WorkspaceKind, type WorkspaceValues } from './models.js';
+import { themeStorageKey } from './theme.js';
+import { isBackgroundConfig } from './background.js';
 
 const databaseName = 'cloudtyping-workspace';
 const itemStore = 'items';

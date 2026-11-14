@@ -1,8 +1,9 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import type pg from 'pg';
-import { PostgresDatabase } from '../postgres/database';
-import { compilePostgresSql } from '../postgres/sql';
-import type { AsyncDatabase, AsyncStatement, AsyncTransaction } from './types';
+import { PostgresDatabase } from '../postgres/database.js';
+import { compilePostgresSql } from '../postgres/sql.js';
+import { decodeEmail } from './email.js';
+import type { AsyncDatabase, AsyncStatement, AsyncTransaction } from './types.js';
 
 type Context = { client: pg.PoolClient; active: boolean };
 
@@ -16,8 +17,15 @@ export class AsyncPostgres implements AsyncDatabase {
     const context = this.context.getStore();
     if (context && !context.active) throw new Error('PostgreSQL transaction is no longer active');
     const compiled = compilePostgresSql(sql, args);
-    const result = await (context?.client ?? this.database.pool).query(compiled.text, compiled.values);
+    const result = context ? await context.client.query(compiled.text, compiled.values)
+      : await this.database.read((client) => client.query(compiled.text, compiled.values));
     for (const field of result.fields) {
+      if (field.name === 'email') {
+        for (const row of result.rows) if (typeof row[field.name] === 'string') row[field.name] = decodeEmail(row[field.name]);
+      }
+      if (field.dataTypeID === 17 && field.name === 'typed') {
+        for (const row of result.rows) if (Buffer.isBuffer(row[field.name])) row[field.name] = row[field.name].toString('utf8');
+      }
       if (field.dataTypeID !== 20) continue;
       for (const row of result.rows) {
         if (row[field.name] === null) continue;

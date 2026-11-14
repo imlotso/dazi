@@ -1,6 +1,7 @@
 import { randomBytes, randomUUID } from 'node:crypto';
 import argon2 from 'argon2';
 import Database from 'better-sqlite3';
+import { AsyncSqlite } from '../server/database/sqlite';
 import Fastify, { type FastifyInstance } from 'fastify';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createApp } from '../server/app';
@@ -19,17 +20,19 @@ const defaults = {
 describe('site settings', () => {
   let db: Database.Database;
   let app: ReturnType<typeof Fastify>;
-  let store: ReturnType<typeof createSiteSettings>;
+  let adapter: AsyncSqlite;
+  let store: Awaited<ReturnType<typeof createSiteSettings>>;
   let audit: Parameters<typeof createSiteSettings>[1];
 
   beforeEach(async () => {
     db = new Database(':memory:');
     db.exec('CREATE TABLE audit (actor_id TEXT, action TEXT, target_type TEXT, reason TEXT)');
-    audit = (actor, action, targetType, _targetId, _targetLabel, reason) => {
+    audit = async (actor, action, targetType, _targetId, _targetLabel, reason) => {
       if (actor.authVersion < 0) throw Object.assign(new Error('管理权限已变更'), { statusCode: 403 });
       db.prepare('INSERT INTO audit VALUES (?,?,?,?)').run(actor.id, action, targetType, reason);
     };
-    store = createSiteSettings(db, audit);
+    adapter = new AsyncSqlite(db);
+    store = await createSiteSettings(adapter, audit);
     app = Fastify();
     await app.register(async (routes: FastifyInstance) => {
       routes.decorateRequest('admin');
@@ -44,7 +47,7 @@ describe('site settings', () => {
 
   afterEach(async () => {
     await app.close();
-    db.close();
+    await adapter.close();
   });
 
   const read = () => app.inject({ method: 'GET', url, headers: { authorization: 'admin' } });
@@ -56,7 +59,7 @@ describe('site settings', () => {
     expect((await read()).json()).toEqual({ settings: defaults, revision: 0 });
     const next = { ...defaults, registrationEnabled: false, guestPracticeEnabled: false, guestLeaderboardEnabled: false, reviewThresholdZh: 200 };
     expect((await write(next)).json()).toEqual({ settings: next, revision: 1 });
-    expect(createSiteSettings(db, audit).read()).toEqual({ settings: next, revision: 1 });
+    expect(await (await createSiteSettings(adapter, audit)).read()).toEqual({ settings: next, revision: 1 });
     expect((await write(next, 1)).json()).toEqual({ settings: next, revision: 1 });
     expect(db.prepare('SELECT * FROM audit').all()).toEqual([{
       actor_id: 'admin', action: 'settings.site.update', target_type: 'setting',
@@ -74,12 +77,12 @@ describe('site settings', () => {
     expect((await write({ ...defaults, extra: false })).statusCode).toBe(400);
     expect((await write(defaults, 99)).statusCode).toBe(409);
     expect(db.prepare('SELECT * FROM audit').all()).toEqual([]);
-    expect(store.read()).toEqual({ settings: defaults, revision: 0 });
+    expect(await store.read()).toEqual({ settings: defaults, revision: 0 });
   });
 
   it('rolls back settings if the audit recheck finds revoked administrator access', async () => {
     expect((await write({ ...defaults, guestPracticeEnabled: false }, 0, 'stale-admin')).statusCode).toBe(403);
-    expect(store.read()).toEqual({ settings: defaults, revision: 0 });
+    expect(await store.read()).toEqual({ settings: defaults, revision: 0 });
     expect(db.prepare('SELECT * FROM audit').all()).toEqual([]);
   });
 });

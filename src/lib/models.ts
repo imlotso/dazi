@@ -1,5 +1,5 @@
-import type { ArticleSource, Difficulty, Language } from '../data/articles';
-import type { BackgroundConfig } from './background';
+import type { ArticleSource, Difficulty, Language } from '../data/articles.js';
+import type { BackgroundConfig } from './background.js';
 
 export type PracticeMode = 'timed' | 'article';
 export type ReaderSettings = {

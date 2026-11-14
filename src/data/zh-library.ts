@@ -1,5 +1,5 @@
 // Public-domain works transcribed from the attributed Wikisource editions.
-import type { Difficulty, Passage } from './articles';
+import type { Difficulty, Passage } from './articles.js';
 
 export const zhPassages: Record<Difficulty, Passage[]> = {
   beginner: [

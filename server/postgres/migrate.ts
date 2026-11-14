@@ -1,5 +1,5 @@
 import type { Client } from 'pg';
-import { schemaSql, schemaVersion } from './schema';
+import { schemaChecksum, schemaSql, schemaVersion } from './schema.js';
 
 export type ExpectedTarget = { database: string; schema: string };
 
@@ -22,12 +22,12 @@ export async function migratePostgres(client: Client, target: ExpectedTarget) {
     const names = tables.rows.map((row) => row.tablename);
     if (!names.includes('dazi_schema_migrations')) {
       if (names.length) throw new Error('PostgreSQL target schema is not empty');
-      await client.query('CREATE TABLE dazi_schema_migrations (version INTEGER PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT now())');
+      await client.query('CREATE TABLE dazi_schema_migrations (version INTEGER PRIMARY KEY, checksum TEXT NOT NULL, applied_at TIMESTAMPTZ NOT NULL DEFAULT now())');
       await client.query(schemaSql);
-      await client.query('INSERT INTO dazi_schema_migrations(version) VALUES ($1)', [schemaVersion]);
+      await client.query('INSERT INTO dazi_schema_migrations(version,checksum) VALUES ($1,$2)', [schemaVersion, schemaChecksum]);
     } else {
-      const versions = await client.query<{ version: number }>('SELECT version FROM dazi_schema_migrations ORDER BY version');
-      if (versions.rows.length !== 1 || versions.rows[0].version !== schemaVersion) throw new Error('Unsupported PostgreSQL schema version');
+      const versions = await client.query<{ version: number; checksum: string }>('SELECT version,checksum FROM dazi_schema_migrations ORDER BY version');
+      if (versions.rows.length !== 1 || versions.rows[0].version !== schemaVersion || versions.rows[0].checksum !== schemaChecksum) throw new Error('Unsupported PostgreSQL schema version');
     }
     await client.query('COMMIT');
   } catch (error) {

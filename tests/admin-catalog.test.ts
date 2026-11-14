@@ -1,4 +1,5 @@
 import Database from 'better-sqlite3';
+import { AsyncSqlite } from '../server/database/sqlite';
 import Fastify, { type FastifyInstance } from 'fastify';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { createCatalogStore, registerCatalogRoutes } from '../server/catalog';
@@ -21,12 +22,14 @@ const archivePayload = { status: 'archived', revision: 1, reason: '校对原文'
 describe('public catalog administration', () => {
   let db: Database.Database;
   let app: ReturnType<typeof Fastify>;
-  let catalog: ReturnType<typeof createCatalogStore>;
+  let adapter: AsyncSqlite;
+  let catalog: Awaited<ReturnType<typeof createCatalogStore>>;
 
   beforeEach(async () => {
     db = new Database(':memory:');
     db.exec('CREATE TABLE audit (action TEXT, target_id TEXT)');
-    catalog = createCatalogStore(db, () => 1_000);
+    adapter = new AsyncSqlite(db);
+    catalog = await createCatalogStore(adapter, () => 1_000);
     app = Fastify();
     // Production installs this hook on the entire admin API scope.
     await app.register(async (routes: FastifyInstance) => {
@@ -45,14 +48,14 @@ describe('public catalog administration', () => {
 
   afterEach(async () => {
     await app.close();
-    db.close();
+    await adapter.close();
   });
 
   const get = (path: string) => app.inject({ method: 'GET', url: '/api/admin/articles' + path, headers: { authorization: 'test-admin' } });
   const post = (path: string, payload: object) => app.inject({ method: 'POST', url: '/api/admin/articles' + path, headers: { authorization: 'test-admin' }, payload });
 
   it('lists safe paged metadata and seeds the public catalog in its original order', async () => {
-    expect(catalog.listPublic()).toEqual(articles);
+    expect((await catalog.listPublic())).toEqual(articles);
     const response = await get('?language=zh&status=published&page=2&pageSize=2');
     expect(response.statusCode).toBe(200);
     const { entries, page, pageSize, total } = response.json();
@@ -69,14 +72,14 @@ describe('public catalog administration', () => {
     const created = await post('', draft);
     expect(created.statusCode).toBe(201);
     const { article: { id } } = created.json();
-    expect(catalog.findPublished(id)).toBeUndefined();
+    expect((await catalog.findPublished(id))).toBeUndefined();
     expect((await post('/' + id + '/status', { revision: 1, status: 'published' })).statusCode).toBe(400);
     const edited = await post('/' + id, { ...draft, text: longText, revision: 1 });
     expect(edited.json().article).toMatchObject({ text: longText, revision: 2, status: 'draft' });
     expect((await post('/' + id, { ...draft, text: longText, revision: 1 })).statusCode).toBe(409);
     const published = await post('/' + id + '/status', { revision: 2, status: 'published' });
     expect(published.json().article).toMatchObject({ revision: 3, status: 'published' });
-    expect(catalog.findPublished(id)).toMatchObject({ content: longText, source: draft.source });
+    expect((await catalog.findPublished(id))).toMatchObject({ content: longText, source: draft.source });
     expect((await post('/' + id, { ...draft, revision: 3 })).statusCode).toBe(400);
     expect((await post('/' + id, { ...draft, revision: 3, text: seeded[0].content })).statusCode).toBe(409);
     expect((await post('/' + id + '/delete', { revision: 3, reason: '删除' })).statusCode).toBe(409);
@@ -93,23 +96,23 @@ describe('public catalog administration', () => {
     expect((await post('/' + id, { ...draft, text: longText, revision: 1 })).statusCode).toBe(200);
     expect((await post('/' + id + '/status', { revision: 2, status: 'published' })).statusCode).toBe(200);
     expect((await post('/' + id, { ...fields, revision: 3 })).statusCode).toBe(400);
-    expect(catalog.findPublished(id)?.source).toEqual(draft.source);
+    expect((await catalog.findPublished(id))?.source).toEqual(draft.source);
   });
 
   it('keeps language coverage and historical groups while preserving archived and deleted state during startup', async () => {
     const archived = await post('/' + seeded[0].id + '/status', archivePayload);
     expect(archived.statusCode).toBe(200);
-    expect(catalog.findPublished(seeded[0].id)).toBeUndefined();
+    expect((await catalog.findPublished(seeded[0].id))).toBeUndefined();
     expect((await post('/' + seeded[1].id + '/status', archivePayload)).statusCode).toBe(409);
     expect((await post('/' + seeded[1].id, {
       ...draft, revision: 1, text: articles.find((item) => item.language === 'en')!.content + ' Revised.', language: 'en',
     })).statusCode).toBe(409);
     expect((await post('/' + seeded[0].id + '/delete', { revision: 2, reason: '已归档' })).statusCode).toBe(200);
-    const reopened = createCatalogStore(db, () => 2_000);
-    expect(reopened.findPublished(seeded[0].id)).toBeUndefined();
-    expect(reopened.hasHistorical(seeded[0].id, 'zh', seeded[0].difficulty)).toBe(true);
+    const reopened = await createCatalogStore(adapter, () => 2_000);
+    expect((await reopened.findPublished(seeded[0].id))).toBeUndefined();
+    expect((await reopened.hasHistorical(seeded[0].id, 'zh', seeded[0].difficulty))).toBe(true);
     expect((await get('/' + seeded[0].id)).statusCode).toBe(404);
-    expect(reopened.counts()).toEqual({ draft: 0, archived: 0, published: articles.length - 1 });
+    expect((await reopened.counts())).toEqual({ draft: 0, archived: 0, published: articles.length - 1 });
   });
 
   it('preserves at least one published article in every difficulty when reclassifying', async () => {
@@ -117,13 +120,13 @@ describe('public catalog administration', () => {
     for (const { id, content, difficulty, ...fields } of beginners.slice(1)) {
       const moved = await post('/' + id, { ...fields, text: content, difficulty: 'intermediate', revision: 1 });
       expect(moved.statusCode).toBe(200);
-      expect(catalog.hasHistorical(id, 'zh', difficulty)).toBe(true);
-      expect(catalog.hasHistorical(id, 'zh', 'intermediate')).toBe(true);
+      expect((await catalog.hasHistorical(id, 'zh', difficulty))).toBe(true);
+      expect((await catalog.hasHistorical(id, 'zh', 'intermediate'))).toBe(true);
     }
     const [{ id, content, ...fields }] = beginners;
     expect((await post('/' + id, { ...fields, text: content, difficulty: 'intermediate', revision: 1 })).statusCode).toBe(409);
     expect((await post('/' + id + '/status', archivePayload)).statusCode).toBe(409);
-    expect(catalog.findPublished(id)?.difficulty).toBe('beginner');
+    expect((await catalog.findPublished(id))?.difficulty).toBe('beginner');
   });
 
   it('counts English words rather than characters before publishing', async () => {
@@ -146,9 +149,9 @@ describe('public catalog administration', () => {
     });
     expect(revoked.statusCode).toBe(403);
     expect(revoked.json()).toEqual({ error: '管理权限已变更' });
-    expect(catalog.counts().draft).toBe(0);
+    expect((await catalog.counts()).draft).toBe(0);
     db.exec("CREATE TRIGGER fail_audit BEFORE INSERT ON audit BEGIN SELECT RAISE(ABORT, 'no audit'); END");
     expect((await post('', draft)).statusCode).toBe(500);
-    expect(catalog.counts().draft).toBe(0);
+    expect((await catalog.counts()).draft).toBe(0);
   });
 });

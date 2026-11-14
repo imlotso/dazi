@@ -18,6 +18,22 @@ jobs:
     name: Application and browser tests
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: ci-only-disposable-password
+          POSTGRES_DB: dazi_ci_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d dazi_ci_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DAZI_TEST_DATABASE_URL: postgresql://postgres:ci-only-disposable-password@127.0.0.1:5432/dazi_ci_test
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -42,6 +58,18 @@ jobs:
           PLAYWRIGHT_SKIP_BROWSER_GC: '1'
       - name: Browser end-to-end tests
         run: npm run test:e2e
+      - name: Browser end-to-end tests with PostgreSQL
+        run: DAZI_E2E_POSTGRES_URL="$DAZI_TEST_DATABASE_URL" npm run test:e2e
+      - name: Select the Vercel Node runtime
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+          cache: npm
+      - name: Verify Node 22 Function and PostgreSQL routes
+        run: |
+          npm ci --no-audit --no-fund
+          npm run test:vercel-esm
+          npx vitest run tests/vercel-routing.test.ts tests/postgres-app.test.ts
       - name: Upload browser diagnostics
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
