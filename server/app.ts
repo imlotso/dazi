@@ -12,13 +12,17 @@ import { catalogSnapshotKey, type ArticleSnapshot, type PracticeMode, type Ranki
 import { createWorkspaceStore, recoveryIdPattern, recoveryKeyPattern, syncBodyLimit, validateWorkspaceItems, WorkspaceLimitError } from './workspace';
 import { AdminAccessError, createAdminAudit, migrateAdministration, registerAdminRoutes } from './admin';
 import { createCatalogStore, registerCatalogRoutes } from './catalog';
+import { createSiteSettings, registerSiteSettingsRoutes } from './site-settings';
+import { createSmtpSettings, type Mailer, type SmtpConfiguration, type SmtpDelivery } from './smtp';
 
-export type Mailer = { sendCode(email: string, code: string, purpose: string): Promise<void> };
+export type { Mailer } from './smtp';
 export type AppOptions = {
   databasePath: string;
   now?: () => number;
   secureCookies?: boolean;
   mailer?: Mailer;
+  smtp?: SmtpConfiguration;
+  smtpDelivery?: SmtpDelivery;
   codeSecret?: string;
   adminEmail?: string;
   staticRoot?: string;
@@ -47,6 +51,7 @@ type Challenge = {
 type Input = Record<string, unknown>;
 type RecoveryClaim = { id: string; expectedVersion: number; requestId: string };
 const practiceTaken = { error: '这次练习已在其他设备恢复', code: 'PRACTICE_TAKEN' } as const;
+const guestPracticeDisabled = { error: '游客在线练习已关闭', code: 'GUEST_ONLINE_PRACTICE_DISABLED' } as const;
 const scoreFinalized = { error: '这次成绩已处理', code: 'SCORE_FINALIZED' } as const;
 const draftDeleted = { error: '这份草稿已删除', code: 'DRAFT_DELETED' } as const;
 const draftMismatch = { error: '练习与草稿不匹配', code: 'DRAFT_MISMATCH' } as const;
@@ -188,6 +193,8 @@ export async function createApp(options: AppOptions) {
   migrateAdministration(db, adminEmail);
   const catalog = createCatalogStore(db, now);
   const audit = createAdminAudit(db, now);
+  const siteSettings = createSiteSettings(db, audit);
+  const smtp = createSmtpSettings(db, { codeSecret: options.codeSecret, deployment: options.smtp, fallbackMailer: options.mailer, delivery: options.smtpDelivery, now });
 
   const app = Fastify({ logger: false, bodyLimit: 128 * 1024, trustProxy: options.trustProxy ?? false });
   await app.register(cookie);
@@ -232,7 +239,7 @@ export async function createApp(options: AppOptions) {
     return user ? `u:${user.id}` : getGuestOwner(request, reply, create);
   };
   const getCodeHash = (email: string, purpose: string, code: string) => createHmac('sha256', codeSecret).update(`${email}\0${purpose}\0${code}`).digest('hex');
-  const consumeCode = (email: string, purpose: string, code: string): boolean => {
+  const verifyCode = (email: string, purpose: string, code: string, consume = true): boolean => {
     const row = db.prepare('SELECT * FROM email_codes WHERE email = ? AND purpose = ?').get(email, purpose) as { code_hash: string; expires_at: number; attempts: number } | undefined;
     if (!row || row.expires_at < now() || row.attempts >= 5 || !/^\d{6}$/.test(code)) return false;
     const supplied = Buffer.from(getCodeHash(email, purpose, code), 'hex');
@@ -241,6 +248,7 @@ export async function createApp(options: AppOptions) {
       db.prepare('UPDATE email_codes SET attempts=attempts+1 WHERE email=? AND purpose=? AND code_hash=? AND attempts<5').run(email, purpose, row.code_hash);
       return false;
     }
+    if (!consume) return true;
     return db.prepare('DELETE FROM email_codes WHERE email=? AND purpose=? AND code_hash=? AND expires_at>=? AND attempts<5')
       .run(email, purpose, row.code_hash, now()).changes === 1;
   };
@@ -270,6 +278,13 @@ export async function createApp(options: AppOptions) {
     });
     registerAdminRoutes(admin, { db, now, audit, publishedArticleCount: () => catalog.counts().published, saveScore });
     registerCatalogRoutes(admin, catalog, audit);
+    registerSiteSettingsRoutes(admin, siteSettings);
+    smtp.register(admin, audit, (request) => {
+      const current = userFor(request);
+      if (!current || current.role !== 'admin' || current.id !== request.admin.id || current.auth_version !== request.admin.authVersion) {
+        throw new AdminAccessError();
+      }
+    });
   }, { prefix: '/api/admin' });
 
   app.get('/api/health', async () => ({ ok: true }));
@@ -284,19 +299,21 @@ export async function createApp(options: AppOptions) {
     const body = bodyOf(request);
     const email = cleanEmail(body.email);
     const purpose = body.purpose;
+    if (purpose === 'register' && !siteSettings.read().settings.registrationEnabled) return invalid(reply, '当前已关闭注册', 403);
     if (!emailPattern.test(email) || email.length > 254 || !['register', 'login', 'reset'].includes(String(purpose))) return invalid(reply, '请输入有效邮箱');
     const existingUser = db.prepare('SELECT disabled_at FROM users WHERE email = ?').get(email) as { disabled_at: number | null } | undefined;
     if ((purpose === 'register' && existingUser) || (purpose !== 'register' && (!existingUser || existingUser.disabled_at !== null))) return { ok: true };
     const previous = db.prepare('SELECT created_at FROM email_codes WHERE email = ? AND purpose = ?').get(email, purpose) as { created_at: number } | undefined;
     if (previous && now() - previous.created_at < 60_000) return invalid(reply, '请稍后再获取验证码', 429);
-    if (!options.mailer) return invalid(reply, '邮件服务尚未配置，请稍后再试', 503);
+    const mailer = smtp.mailer();
+    if (!mailer) return invalid(reply, '邮件服务尚未配置，请稍后再试', 503);
     const code = String(randomInt(0, 1_000_000)).padStart(6, '0');
     const codeHash = getCodeHash(email, String(purpose), code);
     const issuedAt = now();
     db.prepare(`INSERT INTO email_codes(email,purpose,code_hash,created_at,expires_at,attempts) VALUES (?,?,?,?,?,0)
       ON CONFLICT(email,purpose) DO UPDATE SET code_hash=excluded.code_hash,created_at=excluded.created_at,expires_at=excluded.expires_at,attempts=0`)
       .run(email, purpose, codeHash, issuedAt, issuedAt + 10 * 60_000);
-    try { await options.mailer.sendCode(email, code, String(purpose)); }
+    try { await mailer.sendCode(email, code, String(purpose)); }
     catch {
       db.prepare('DELETE FROM email_codes WHERE email = ? AND purpose = ? AND code_hash = ?').run(email, purpose, codeHash);
       return invalid(reply, '邮件发送失败，请稍后再试', 503);
@@ -305,6 +322,7 @@ export async function createApp(options: AppOptions) {
   });
 
   app.post('/api/auth/register', { config: { rateLimit: { max: 10, timeWindow: '1 minute' } } }, async (request, reply) => {
+    if (!siteSettings.read().settings.registrationEnabled) return invalid(reply, '当前已关闭注册', 403);
     const body = bodyOf(request);
     const email = cleanEmail(body.email);
     const username = typeof body.username === 'string' ? body.username.trim() : '';
@@ -312,17 +330,22 @@ export async function createApp(options: AppOptions) {
     const code = typeof body.code === 'string' ? body.code : '';
     if (!emailPattern.test(email) || email.length > 254 || !/^[\p{L}\p{N}_-]{3,24}$/u.test(username) || password.length < 10 || password.length > 128) return invalid(reply, '用户名需为 3–24 位字母、数字或下划线，密码至少 10 位');
     if (db.prepare('SELECT id FROM users WHERE email = ? OR username = ?').get(email, username)) return invalid(reply, '账号信息不可用，请检查后重试', 409);
-    if (!consumeCode(email, 'register', code)) return invalid(reply, '验证码错误或已过期');
+    if (!verifyCode(email, 'register', code, false)) return invalid(reply, '验证码错误或已过期');
     const passwordHash = await argon2.hash(password, { type: argon2.argon2id });
-    const user = db.transaction((): User | undefined => {
-      if (db.prepare('SELECT id FROM users WHERE email=? OR username=?').get(email, username)) return undefined;
+    const registration = db.transaction((): { user: User } | { error: string; status: number } => {
+      if (!siteSettings.read().settings.registrationEnabled) return { error: '当前已关闭注册', status: 403 };
+      if (db.prepare('SELECT id FROM users WHERE email=? OR username=?').get(email, username)) {
+        return { error: '账号信息不可用，请检查后重试', status: 409 };
+      }
+      if (!verifyCode(email, 'register', code)) return { error: '验证码错误或已过期', status: 400 };
       const bootstrap = email === adminEmail && !db.prepare("SELECT 1 FROM users WHERE role='admin' LIMIT 1").get();
       const account: User = { id: randomUUID(), username, email, password_hash: passwordHash, role: bootstrap ? 'admin' : 'user', auth_version: 0 };
       db.prepare('INSERT INTO users(id,username,email,password_hash,role,created_at) VALUES (?,?,?,?,?,?)')
         .run(account.id, account.username, account.email, account.password_hash, account.role, now());
-      return account;
+      return { user: account };
     }).immediate();
-    if (!user) return invalid(reply, '账号信息不可用，请检查后重试', 409);
+    if ('error' in registration) return invalid(reply, registration.error, registration.status);
+    const { user } = registration;
     if (!startSession(reply, user)) return invalid(reply, '账号或密码不正确', 401);
     return { user: publicUser(user) };
   });
@@ -343,7 +366,7 @@ export async function createApp(options: AppOptions) {
     const email = cleanEmail(body.email);
     const code = typeof body.code === 'string' ? body.code : '';
     const user = db.prepare('SELECT * FROM users WHERE email = ? AND disabled_at IS NULL').get(email) as User | undefined;
-    if (!user || !consumeCode(email, 'login', code)) return invalid(reply, '邮箱或验证码不正确', 401);
+    if (!user || !verifyCode(email, 'login', code)) return invalid(reply, '邮箱或验证码不正确', 401);
     if (!startSession(reply, user)) return invalid(reply, '邮箱或验证码不正确', 401);
     return { user: publicUser(user) };
   });
@@ -354,7 +377,7 @@ export async function createApp(options: AppOptions) {
     const code = typeof body.code === 'string' ? body.code : '';
     const password = typeof body.password === 'string' ? body.password : '';
     const user = db.prepare('SELECT * FROM users WHERE email = ? AND disabled_at IS NULL').get(email) as User | undefined;
-    if (!user || password.length < 10 || password.length > 128 || !consumeCode(email, 'reset', code)) return invalid(reply, '邮箱、验证码或新密码不正确');
+    if (!user || password.length < 10 || password.length > 128 || !verifyCode(email, 'reset', code)) return invalid(reply, '邮箱、验证码或新密码不正确');
     const hash = await argon2.hash(password, { type: argon2.argon2id });
     const reset = db.transaction(() => {
       const changed = db.prepare('UPDATE users SET password_hash=?,auth_version=auth_version+1 WHERE id=? AND auth_version=? AND disabled_at IS NULL')
@@ -484,6 +507,7 @@ export async function createApp(options: AppOptions) {
   }
 
   app.post('/api/tests/start', async (request, reply) => {
+    if (!userFor(request) && !siteSettings.read().settings.guestPracticeEnabled) return reply.code(403).send(guestPracticeDisabled);
     const expected = expectedAccount(request);
     if (expected !== undefined) {
       const user = userFor(request);
@@ -592,6 +616,7 @@ export async function createApp(options: AppOptions) {
           .run(owner, elapsedMs, elapsedMs, claim?.id ?? null, claimVersion ?? 0, claim?.requestId ?? null, boundDraftId, id);
       }
     } else {
+      if (!user && !siteSettings.read().settings.guestPracticeEnabled) return { disabled: true };
       const article = catalog.findPublished(articleId);
       if (!article || article.content !== target || (articleKey !== undefined &&
         articleKey !== catalogSnapshotKey({ ...article, text: article.content, custom: false }))) return undefined;
@@ -639,6 +664,7 @@ export async function createApp(options: AppOptions) {
       id, recoveryHash: key ? digest(key) : null, articleId, articleKey, target, duration, mode, strict, elapsedMs, claim, draftId,
       expectedProgressVersion, recoveryMarker,
     });
+    if (result && 'disabled' in result) return reply.code(403).send(guestPracticeDisabled);
     if (result && 'conflict' in result) return reply.code(409).send(result.conflict);
     return result ?? invalid(reply, '练习记录不存在', 404);
   });
@@ -786,7 +812,8 @@ export async function createApp(options: AppOptions) {
     const staleServerEvidence = lastSampleElapsed === null || serverTail > 10_000;
     const staleClientEvidence = clientTimed && (lastClientElapsed === null || clientTail > 10_000);
     if (minimumCheckpoints > 0 && (staleServerEvidence || staleClientEvidence)) reasons.push('stale_activity');
-    if (challenge.language === 'zh' ? speed > 220 : speed > 180) reasons.push('high_speed');
+    const thresholds = siteSettings.read().settings;
+    if (challenge.language === 'zh' ? speed > thresholds.reviewThresholdZh : speed > thresholds.reviewThresholdEn) reasons.push('high_speed');
     if (challenge.pause_count > 0) reasons.push('paused_session');
     if (challenge.recovered) reasons.push('recovered_session');
     if (clientTimed && (elapsed - elapsedMs > 3000 || challenge.missing_client_checkpoint_time)) reasons.push('timing_discrepancy');
@@ -817,6 +844,7 @@ export async function createApp(options: AppOptions) {
       if (challenge.claim_id) return { status: challenge.status === 'review' ? 'review' : 'ranked' } as const;
       return { error: '这次成绩无法重复提交', code: 409 } as const;
     }
+    if (owner.startsWith('g:') && !siteSettings.read().settings.guestLeaderboardEnabled) return { error: '游客提交排行榜已关闭', code: 403 } as const;
     const nicknameLength = splitCharacters(nickname).length;
     if (nicknameLength < 1 || nicknameLength > maxNicknameLength || /[\p{Cc}\p{Cf}]/u.test(nickname)) {
       return { error: `昵称需为 1–${maxNicknameLength} 个字符`, code: 400 } as const;

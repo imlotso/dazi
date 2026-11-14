@@ -11,6 +11,28 @@ let now: number;
 beforeEach(() => { localStorage.clear(); sessionStorage.clear(); now = 0; vi.spyOn(performance, 'now').mockImplementation(() => now); });
 afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
+it('keeps a guest practice local after the server disables new online practices', async () => {
+  const fetch = vi.fn(async () => response({ error: '游客在线练习已关闭', code: 'GUEST_ONLINE_PRACTICE_DISABLED' }, false, 403));
+  vi.stubGlobal('fetch', fetch);
+  const first = renderHook(() => usePractice(config, null));
+  act(() => first.result.current.updateTyped('甲'));
+  await waitFor(() => expect(first.result.current.feedback).toBe('游客在线练习已关闭，已转为本地练习。'));
+  expect(first.result.current.phase).toBe('running');
+  now = 2000;
+  await act(() => first.result.current.pause());
+  const saved = readDraft()!;
+  expect(saved).toMatchObject({ typed: '甲', personalOnly: true, offline: true });
+  first.unmount();
+
+  const second = renderHook(() => usePractice(config, saved));
+  await act(() => second.result.current.resume());
+  now = 3000;
+  await act(async () => second.result.current.updateTyped(article.text));
+  await waitFor(() => expect(second.result.current.result).toMatchObject({ offline: true, score: { correct: 4 } }));
+  expect(second.result.current.canRetryOnline).toBe(false);
+  expect(fetch).toHaveBeenCalledTimes(1);
+});
+
 it('restores a timed-out online start and submits the same round after reconnecting', async () => {
   let online = false;
   let start: Record<string, unknown> | undefined;
