@@ -3,6 +3,9 @@ import { randomBytes } from 'node:crypto';
 import pg from 'pg';
 import { PostgresDatabase } from '../server/postgres/database';
 import { migratePostgres } from '../server/postgres/migrate';
+import { AsyncPostgres } from '../server/database/postgres';
+import { createAsyncWorkspaceStore } from '../server/database/workspace';
+import type { WorkspaceItem } from '../src/lib/models';
 
 const url = process.env.DAZI_TEST_DATABASE_URL;
 const suite = url ? describe : describe.skip;
@@ -57,6 +60,34 @@ suite('PostgreSQL transactional data layer', () => {
     await disconnected;
     await expect(databases[0].verifySchema()).resolves.toBeUndefined();
     expect(Number((await databases[0].pool.query('SELECT revision FROM site_settings WHERE id=1')).rows[0].revision)).toBe(13);
+  });
+
+  it('binds existing statement syntax and returns safe integer values through the asynchronous adapter', async () => {
+    const adapter = new AsyncPostgres(databases[0]);
+    await adapter.prepare('INSERT INTO users(id,username,email,password_hash,created_at) VALUES (@id,@username,@email,@hash,@time)').run({
+      id: 'u-test', username: 'Testing', email: 'testing@example.test', hash: 'hash', time: 1700000000000,
+    });
+    expect(await adapter.prepare('SELECT created_at AS createdAt FROM users WHERE id=?').get('u-test')).toEqual({ createdAt: 1700000000000 });
+    await expect(adapter.transaction(async () => {
+      await adapter.prepare('DELETE FROM users WHERE id=?').run('u-test');
+      throw new Error('abort adapter');
+    })()).rejects.toThrow('abort adapter');
+    expect(await adapter.prepare('SELECT COUNT(*) AS count FROM users').get()).toEqual({ count: 1 });
+  });
+
+  it('keeps a draft tombstone through concurrent workspace writes on separate instances', async () => {
+    await setup.query("INSERT INTO users(id,username,email,password_hash,created_at) VALUES ('workspace-user','Workspace','workspace@example.test','hash',1)");
+    const first = await createAsyncWorkspaceStore(new AsyncPostgres(databases[0]));
+    const second = await createAsyncWorkspaceStore(new AsyncPostgres(databases[1]));
+    const live: WorkspaceItem = { kind: 'draft', id: 'draft-1', updatedAt: 20, value: {
+      id: 'draft-1', article: { id: 'a', title: 'a', text: 'a\0b', language: 'zh', difficulty: 'beginner', custom: true },
+      typed: '', elapsedMs: 1, backspaces: 0, duration: 60, mode: 'timed', strict: false, offset: 0,
+      recordId: 'record-1', offline: true, savedAt: 1, claimVersion: 2, progressVersion: 3,
+    } };
+    const deleted: WorkspaceItem = { kind: 'draft', id: 'draft-1', updatedAt: 1, deleted: true };
+    await Promise.all([first.merge('workspace-user', [live]), second.merge('workspace-user', [deleted])]);
+    expect(await first.get('workspace-user')).toEqual([deleted]);
+    expect((await second.pagedSnapshot('workspace-user', undefined, undefined)).items).toEqual([deleted]);
   });
 });
 
