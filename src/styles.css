@@ -48,8 +48,8 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .select-wrap svg { pointer-events: none; position: absolute; right: 13px; }
 .difficulty-switch button { min-width: 76px; padding: 7px 17px; font-size: 15px; }
 .status-row { display: flex; flex-wrap: wrap; align-items: center; gap: 0; margin: 24px 0 12px; color: #5d5784; font-size: 16px; }
-.status-row span { display: inline-flex; align-items: center; gap: 8px; padding-right: 24px; margin-right: 24px; border-right: 1px solid #d7cfe7; white-space: nowrap; }
-.status-row span:last-child { border-right: 0; padding-right: 0; margin-right: 0; }
+.status-row > span { display: inline-flex; align-items: center; gap: 8px; padding-right: 24px; margin-right: 24px; border-right: 1px solid #d7cfe7; white-space: nowrap; }
+.status-row > span:last-child { border-right: 0; padding-right: 0; margin-right: 0; }
 .progress-row { display: flex; flex-wrap: wrap; gap: 8px 24px; color: #6a6389; font-size: 14px; margin: 0 0 16px; }
 .progress-row b, .status-row b { font-weight: 700; font-variant-numeric: tabular-nums; }
 .typing-panel { padding: 18px 20px 12px; background: rgba(255,255,255,.92); border: 1px solid #d5cbef; border-radius: 19px; box-shadow: 0 4px 18px rgba(83, 69, 129, .035); }
@@ -94,6 +94,23 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .result-metrics { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin: 25px 0; }.result-metrics > div { display: grid; gap: 4px; text-align: center; padding: 14px 4px; border-radius: 14px; background: #f4f0fb; }.result-metrics strong { color: #7762bf; font-size: 23px; }.result-metrics span { color: var(--typing-muted); font-size: 12px; }
 .rank-submit { display: grid; gap: 14px; }.rank-submit .primary-button { width: 100%; }.result-actions { display: flex; justify-content: space-between; align-items: center; margin-top: 20px; }
 .result-metrics small { color: var(--typing-muted); font-size: 11px; }
+.english-speed { min-width: 0; }
+.status-row:has(.english-speed) { align-items: flex-start; }
+.status-row:has(.english-speed) > span { min-height: 44px; }
+.english-speed-values { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; }
+.english-speed-values > svg { flex: none; }
+.english-speed-value { white-space: nowrap; }
+.english-speed-value strong { font-variant-numeric: tabular-nums; }
+.english-speed .icon-button { min-width: 44px; min-height: 44px; }
+.english-speed-explanation { max-width: 370px; margin: 0 0 8px; border: 1px solid var(--typing-border); border-radius: 12px; background: var(--typing-input); color: var(--typing-muted); padding: 10px 12px; text-align: start; font-size: 13px; line-height: 1.65; }
+.english-speed-explanation p { margin: 0; }
+.english-speed-explanation p + p { margin-top: 6px; }
+.english-speed-explanation strong { color: var(--typing-text); }
+.result-metrics > .english-speed-result { grid-column: 1 / -1; padding: 8px 12px; }
+.english-speed-result .english-speed-values { justify-content: center; }
+.english-speed-result .english-speed-value { display: grid; gap: 2px; min-width: 68px; }
+.english-speed-result .english-speed-explanation { max-width: none; margin: 0; }
+.result-metrics .english-speed-explanation strong { color: var(--typing-text); font-size: inherit; }
 .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0; }
 
 :root[data-theme='dark'] { color-scheme: dark; color: #ece8fa; background: #17192c; }
@@ -108,7 +125,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 [data-theme='dark'] .segmented button { color: #e7e2f7; }
 [data-theme='dark'] .segmented button[aria-pressed='true'] { color: #fff; background: #526fae; }
 [data-theme='dark'] .segmented button:not([aria-pressed='true']):not(:disabled):hover { background: #42405f; }
-[data-theme='dark'] .filter-divider, [data-theme='dark'] .status-row span { border-color: #76708b; }
+[data-theme='dark'] .filter-divider, [data-theme='dark'] .status-row > span { border-color: #76708b; }
 [data-theme='dark'] .filter-divider { background: #76708b; }
 [data-theme='dark'] .article-picker, [data-theme='dark'] .difficulty-picker, [data-theme='dark'] .status-row { color: #ece8fa; }
 [data-theme='dark'] .duration-input, [data-theme='dark'] .progress-row { color: #ece8fa; }
@@ -158,7 +175,10 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
   .workspace { width: calc(100% - 24px); padding: 22px 0 145px; }
   .top-filters { gap: 8px; }.filter-divider { height: 25px; }.segmented button { min-width: 0; padding: 8px 12px; font-size: 14px; }.language-switch button { min-width: 62px; }.duration-input { gap: 4px; font-size: 13px; flex: none; white-space: nowrap; }.duration-input svg { width: 18px; height: 18px; }.duration-input input { width: 48px; padding: 7px 4px; }
   .detail-filters { gap: 12px; margin-top: 19px; }.article-choice, .article-picker, .difficulty-picker { width: 100%; font-size: 14px; }.article-choice { flex-wrap: nowrap; }.article-picker { min-width: 0; }.custom-button { flex: none; }.select-wrap { flex: 1; min-width: 0; }.select-wrap select { width: 100%; }.difficulty-picker { justify-content: flex-start; }.difficulty-switch { flex: 1; }.difficulty-switch button { flex: 1; }
-  .status-row { gap: 8px 12px; margin: 18px 0 10px; font-size: 13px; }.status-row span { padding-right: 12px; margin-right: 0; }.status-row svg { width: 18px; height: 18px; }.progress-row { gap: 6px 16px; font-size: 13px; }
+  .status-row { gap: 8px 12px; margin: 18px 0 10px; font-size: 13px; }.status-row > span { padding-right: 12px; margin-right: 0; }.status-row svg { width: 18px; height: 18px; }.progress-row { gap: 6px 16px; font-size: 13px; }
+  .status-row:has(.english-speed) > span { min-height: 0; }
+  .status-row:has(.english-speed) > span:nth-child(2) { border-right: 0; padding-right: 0; }
+  .english-speed-live { flex-basis: 100%; }
   .typing-panel { padding: 12px 10px 10px; }
   .start-button { min-width: 112px; min-height: 42px; padding-inline: 14px; font-size: 13px; }.practice-notice { padding: 0 6px; line-height: 1.6; }.sleeping-cat { width: 180px; right: 4%; bottom: 1%; }
   .content-panel { padding: 20px 17px; }.rank-accuracy { display: none; }.ranking-list li { gap: 8px; }.dialog { padding: 23px 20px; }

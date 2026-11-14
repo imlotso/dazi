@@ -172,13 +172,13 @@ describe('line-by-line practice', () => {
   });
 
   it('waits for online restoration before allowing the open restart dialog to discard progress', async () => {
-    let resolvePause!: (value: Response) => void;
-    let pauseCalls = 0;
+    let resolveRecovery!: (value: Response) => void;
+    let recovery: { clientId: string; expectedClaimVersion: number } | undefined;
     vi.stubGlobal('fetch', vi.fn((url: string, options?: RequestInit) => {
       const response = (value: unknown) => Promise.resolve({ ok: true, json: async () => value } as Response);
       if (url === '/api/me') return response({ user: null });
       if (url === '/api/tests/start') return response({ id: JSON.parse(String(options?.body)).clientId, target: articles[0].content });
-      if (url.endsWith('/pause') && ++pauseCalls === 2) return new Promise<Response>((resolve) => { resolvePause = resolve; });
+      if (url === '/api/tests/recover') { recovery = JSON.parse(String(options?.body)); return new Promise<Response>((resolve) => { resolveRecovery = resolve; }); }
       return response({ elapsedMs: 0, remainingMs: 300000 });
     }));
     render(<App />);
@@ -190,7 +190,8 @@ describe('line-by-line practice', () => {
     const dialog = await screen.findByRole('dialog', { name: '重新开始本次练习？' });
     fireEvent(window, new PageTransitionEvent('pageshow', { persisted: true }));
     expect((within(dialog).getByRole('button', { name: '确认重新开始' }) as HTMLButtonElement).disabled).toBe(true);
-    await act(async () => resolvePause({ ok: true, json: async () => ({ elapsedMs: 0, remainingMs: 300000 }) } as Response));
+    await waitFor(() => expect(resolveRecovery).toBeTypeOf('function'));
+    await act(async () => resolveRecovery({ ok: true, json: async () => ({ id: recovery!.clientId, status: 'paused', elapsedMs: 0, remainingMs: 300000, claimVersion: recovery!.expectedClaimVersion + 1 }) } as Response));
     fireEvent.click(within(dialog).getByRole('button', { name: '确认重新开始' }));
     expect(activeInput().disabled).toBe(false);
     expect(readDraft()).toBeNull();

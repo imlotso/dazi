@@ -3,7 +3,7 @@ import React from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { App } from '../src/App';
-import { readDraft } from '../src/hooks/usePractice';
+import { readDraft, readDrafts } from '../src/hooks/usePractice';
 import { articles } from '../src/data/articles';
 
 type RequestInitWithBody = RequestInit & { body?: string };
@@ -366,7 +366,7 @@ describe('practice interface', () => {
     fireEvent.change(firstInput, { target: { value: '你好世界' } });
     const finished = await screen.findByRole('dialog', { name: '练习成绩' });
     expect(within(finished).getByText('4 / 4')).toBeTruthy();
-    expect(readDraft()?.typed).toBe('你');
+    expect(readDrafts().some((draft) => draft.typed === '你' && !draft.completed)).toBe(true);
   });
 
   it('returns from browser back-forward cache in a paused state without counting the absence', async () => {

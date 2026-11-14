@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState, type ChangeEvent, type CompositionEvent, type KeyboardEvent } from 'react';
 import type { Difficulty, Language } from '../data/articles';
 import { api, ApiError } from '../lib/api';
-import { catalogSnapshotKey, snapshotKey, type ArticleSnapshot, type MistakeSample, type PracticeMode, type PracticeRecord, type SavedPractice } from '../lib/models';
+import { catalogSnapshotKey, compareDraftProgress, sameDraftSnapshot, snapshotKey, type ArticleSnapshot, type MistakeSample, type PracticeMode, type PracticeRecord, type SavedPractice } from '../lib/models';
 import { scoreTyping, splitCharacters, type Score } from '../lib/scoring';
 
 export type PracticePhase = 'ready' | 'starting' | 'running' | 'pausing' | 'paused' | 'resuming' | 'restoring' | 'finishing' | 'finished';
@@ -13,17 +13,20 @@ export type PracticeConfig = RoundConfig & {
   onRecord?: (record: PracticeRecord) => void;
   onDraft?: (draft: SavedPractice) => void;
   onRemoveDraft?: (id: string, ownerId: string | null) => void;
+  onReplaceRecord?: (id: string, ownerId: string | null) => void;
   isDraftDeleted?: (id: string, ownerId: string | null) => boolean;
 };
-export type PracticeResult = { score: Score; attemptId?: string; status?: string; eligible?: boolean; offline: boolean; language: Language; elapsedMs: number; backspaces: number; errors: number; articleTotal: number; custom: boolean; continuation?: SavedPractice };
+export type PracticeResult = { score: Score; attemptId?: string; status?: string; eligible?: boolean; submitted?: boolean; offline: boolean; language: Language; elapsedMs: number; backspaces: number; errors: number; articleTotal: number; custom: boolean; continuation?: SavedPractice };
 type Attempt = RoundConfig & {
   id?: string; recordId: string; revision: number; legacy?: boolean; target: string;
   offline: boolean; elapsedMs: number; startedAt: number | null; suspicious: boolean;
   backspaces: number; nextCheckpointMs: number; offset?: number; mistakes?: MistakeSample[]; pendingStart?: boolean;
+  recoveryId?: string; recoveryKey?: string; claimId?: string; claimVersion?: number; recoveryRequestId?: string; recoveryMarker?: string; progressVersion?: number; recoveryBaseVersion?: number; progressFingerprint?: string; personalOnly?: boolean;
 };
 export type PracticeDraft = Omit<Attempt, 'startedAt' | 'nextCheckpointMs'> & { version: 1; typed: string; completed?: boolean; early?: boolean; savedAt?: number; leaseOwner?: string | null; leaseAt?: number };
 export type History = PracticeRecord;
-type ServerResult = { attemptId: string; score: Score; status: string; eligible: boolean; elapsedMs: number };
+type ServerResult = { attemptId: string; score: Score; status: string; eligible: boolean; elapsedMs: number; submitted?: boolean };
+type RecoveryState = { id: string; status: string; elapsedMs?: number; remainingMs?: number; claimVersion?: number; result?: ServerResult; typed?: string; backspaces?: number };
 
 const articleLimitMs = 24 * 60 * 60 * 1000;
 const draftIntervalMs = 5000;
@@ -43,11 +46,26 @@ function clientChallengeId() {
     return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
   } catch { return undefined; }
 }
+function clientRecoveryKey() {
+  try {
+    const bytes = globalThis.crypto.getRandomValues(new Uint8Array(32));
+    return btoa(Array.from(bytes, (byte) => String.fromCharCode(byte)).join('')).replaceAll('+', '-').replaceAll('/', '_').replaceAll('=', '');
+  } catch { return undefined; }
+}
 const leaseTaken = (draft: PracticeDraft, owner: string) => !!draft.leaseOwner && draft.leaseOwner !== owner && typeof draft.leaseAt === 'number' && Date.now() - draft.leaseAt < 15_000;
 export const draftAwaitingStart = (draft: PracticeDraft) => !!draft.pendingStart && leaseTaken(draft, '');
 const validDuration = (seconds: number) => Number.isInteger(seconds) && seconds >= 60 && seconds <= 3600 && seconds % 60 === 0;
 const durationLimit = (round: Pick<RoundConfig, 'mode' | 'duration'>) => round.mode === 'article' ? articleLimitMs : round.duration * 1000;
 const validAttemptId = (id: string) => /^[\w-]{1,80}$/.test(id);
+const recoveryUuid = (id: string | undefined): id is string => !!id && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(id);
+function recoverableId(attempt: Attempt) {
+  if (attempt.custom || attempt.personalOnly || (attempt.offset ?? 0) > 0) return undefined;
+  return [attempt.recoveryId, attempt.id, attempt.recordId].find(recoveryUuid);
+}
+function practiceClaim(attempt: Attempt): Record<string, string> | undefined {
+  return recoveryUuid(attempt.claimId) && Number.isSafeInteger(attempt.claimVersion) && attempt.claimVersion! > 0
+    ? { 'X-Practice-Claim': `${attempt.claimId}:${attempt.claimVersion}` } : undefined;
+}
 export const practiceDraftId = (recordId: string) => `draft-${recordId}`;
 function nextRecordId(recordId: string) {
   const [base, sequence] = recordId.split('~');
@@ -88,8 +106,8 @@ function storedDraft(recordId: string): PracticeDraft | null {
 export function localHistory(): History[] {
   try { const value = JSON.parse(localStorage.getItem(historyKey) || '[]'); return Array.isArray(value) ? value.slice(0, 50) : []; } catch { return []; }
 }
-function rememberHistory(entry: History) {
-  try { localStorage.setItem(historyKey, JSON.stringify([entry, ...localHistory().filter((item) => !entry.recordId || item.recordId !== entry.recordId)].slice(0, 50))); } catch { /* Practice still works without storage. */ }
+function rememberHistory(entry: History, previousId?: string) {
+  try { localStorage.setItem(historyKey, JSON.stringify([entry, ...localHistory().filter((item) => item.ownerId !== entry.ownerId || !item.recordId || (item.recordId !== entry.recordId && item.recordId !== previousId))].slice(0, 50))); } catch { /* Practice still works without storage. */ }
 }
 export function readDrafts(ownerId?: string | null): PracticeDraft[] {
   try {
@@ -146,12 +164,20 @@ export function discardSavedDraft(saved: SavedPractice): boolean {
 function elapsedTime(attempt: Attempt) {
   return Math.min(durationLimit(attempt), attempt.elapsedMs + (attempt.startedAt === null ? 0 : Math.max(0, performance.now() - attempt.startedAt)));
 }
+function progressFingerprint(attempt: Pick<Attempt, 'backspaces' | 'offset' | 'suspicious' | 'mistakes'>, typed: string, elapsed: number) {
+  return JSON.stringify([typed, elapsed, attempt.backspaces, attempt.offset ?? 0, !!attempt.suspicious, attempt.mistakes ?? []]);
+}
 function saveDraft(attempt: Attempt, typed: string, owner: string, completed = false, early = false) {
-  const { startedAt: _startedAt, nextCheckpointMs: _nextCheckpointMs, ...rest } = attempt;
-  const data: PracticeDraft = { ...rest, revision: attempt.revision + 1, version: 1, elapsedMs: elapsedTime(attempt), typed, completed, early, savedAt: Date.now(), leaseOwner: owner, leaseAt: Date.now() };
+  const { startedAt: _startedAt, nextCheckpointMs: _nextCheckpointMs, progressFingerprint: _fingerprint, ...rest } = attempt;
+  const elapsed = elapsedTime(attempt);
+  const fingerprint = progressFingerprint(attempt, typed, elapsed);
+  const version = (attempt.progressVersion ?? 0) + Number(attempt.progressFingerprint !== fingerprint);
+  const data: PracticeDraft = { ...rest, revision: attempt.revision + 1, progressVersion: version, version: 1, elapsedMs: elapsed, typed, completed, early, savedAt: Date.now(), leaseOwner: owner, leaseAt: Date.now() };
   try {
     localStorage.setItem(draftPrefix + attempt.recordId, JSON.stringify(data));
     attempt.revision = data.revision;
+    attempt.progressVersion = data.progressVersion;
+    attempt.progressFingerprint = fingerprint;
     if (attempt.legacy) { localStorage.removeItem(legacyDraftKey); attempt.legacy = false; }
     try { sessionStorage.setItem(currentDraftKey, attempt.recordId); } catch { /* Most recent draft remains discoverable. */ }
     return true;
@@ -188,7 +214,10 @@ function workspaceDraft(attempt: Attempt, typed: string): SavedPractice {
   return {
     id: practiceDraftId(attempt.recordId), article, typed, elapsedMs: Math.round(elapsedTime(attempt)), backspaces: attempt.backspaces,
     duration: attempt.duration, mode: attempt.mode ?? 'timed', strict: !!attempt.strict, offset: attempt.offset ?? 0,
-    recordId: attempt.recordId, attemptId: attempt.offline ? undefined : attempt.id, offline: attempt.offline,
+    recordId: attempt.recordId, attemptId: attempt.id, recoveryId: attempt.recoveryId, recoveryKey: attempt.recoveryKey,
+    claimVersion: attempt.claimVersion, recoveryMarker: attempt.recoveryMarker,
+    recoveryBaseVersion: attempt.recoveryRequestId ? attempt.recoveryBaseVersion : undefined,
+    progressVersion: attempt.progressVersion, personalOnly: attempt.personalOnly, offline: attempt.offline,
     ownerId: attempt.ownerId, savedAt: Date.now(), mistakes: [...(attempt.mistakes ?? [])], suspicious: attempt.suspicious,
   };
 }
@@ -207,7 +236,8 @@ function attemptFromSaved(saved: SavedPractice, typed: string, revision = 0): At
   return {
     articleId, title, text, language, difficulty, custom, article: saved.article, target: text,
     ownerId: saved.ownerId, duration: saved.duration, mode: saved.mode, strict: saved.strict,
-    id: offline ? undefined : saved.attemptId, recordId: saved.recordId, revision, offline,
+    id: custom || saved.offset > 0 || saved.personalOnly ? undefined : saved.attemptId, recoveryId: saved.recoveryId, recoveryKey: saved.recoveryKey,
+    claimVersion: saved.claimVersion, progressVersion: saved.progressVersion, recoveryBaseVersion: saved.progressVersion, personalOnly: saved.personalOnly, recordId: saved.recordId, revision, offline,
     elapsedMs: Math.min(durationLimit(saved), Math.max(0, saved.elapsedMs)), startedAt: null, nextCheckpointMs: saved.elapsedMs + 5000,
     backspaces: saved.backspaces, suspicious: !!saved.suspicious, offset: Math.min(saved.offset, splitCharacters(typed).length), mistakes: [...(saved.mistakes ?? []).slice(0, mistakeLimit)],
   };
@@ -215,9 +245,9 @@ function attemptFromSaved(saved: SavedPractice, typed: string, revision = 0): At
 
 export function usePractice(config: PracticeConfig, initialDraft: PracticeDraft | null) {
   const ownerToken = useRef(uniqueId());
-  const [draft] = useState<PracticeDraft | null>(() => initialDraft && leaseTaken(initialDraft, ownerToken.current) && !initialDraft.completed ? { ...initialDraft, id: undefined, recordId: uniqueId(), revision: 0, offline: true, legacy: false, leaseOwner: null, leaseAt: 0 } : initialDraft);
+  const [draft] = useState<PracticeDraft | null>(() => initialDraft && leaseTaken(initialDraft, ownerToken.current) && !initialDraft.completed ? { ...initialDraft, id: undefined, recoveryId: undefined, recoveryKey: undefined, claimId: undefined, claimVersion: undefined, recoveryRequestId: undefined, recoveryMarker: undefined, progressVersion: 0, recoveryBaseVersion: undefined, personalOnly: true, recordId: uniqueId(), revision: 0, offline: true, legacy: false, leaseOwner: null, leaseAt: 0 } : initialDraft);
   const wasForked = !!draft && !!initialDraft && draft.recordId !== initialDraft.recordId;
-  const restoredAttempt: Attempt | null = draft ? { ...draft, startedAt: null, nextCheckpointMs: draft.elapsedMs + 5000 } : null;
+  const restoredAttempt: Attempt | null = draft ? { ...draft, recoveryBaseVersion: draft.recoveryBaseVersion ?? draft.progressVersion, progressFingerprint: progressFingerprint(draft, draft.typed, draft.elapsedMs), startedAt: null, nextCheckpointMs: draft.elapsedMs + 5000 } : null;
   const initialPhase: PracticePhase = draft ? (draft.completed || (draft.id && !draft.offline) ? 'restoring' : 'paused') : 'ready';
   const [phase, setPhase] = useState<PracticePhase>(initialPhase);
   const phaseRef = useRef<PracticePhase>(initialPhase);
@@ -259,7 +289,7 @@ export function usePractice(config: PracticeConfig, initialDraft: PracticeDraft 
     if (deleted || (existing && (leaseTaken(existing, ownerToken.current) || (existing.revision ?? 0) > attempt.revision)) ||
       (!existing && attempt.revision > 0 && !attempt.legacy)) {
       if (deleted) clearDraft(attempt, ownerToken.current);
-      attempt.recordId = uniqueId(); attempt.revision = 0; attempt.id = undefined; attempt.offline = true; attempt.legacy = false; attempt.pendingStart = false;
+      attempt.recordId = uniqueId(); attempt.revision = 0; attempt.id = undefined; attempt.recoveryId = undefined; attempt.recoveryKey = undefined; attempt.claimId = undefined; attempt.claimVersion = undefined; attempt.recoveryRequestId = undefined; attempt.recoveryMarker = undefined; attempt.progressVersion = 0; attempt.recoveryBaseVersion = undefined; attempt.progressFingerprint = undefined; attempt.personalOnly = true; attempt.offline = true; attempt.legacy = false; attempt.pendingStart = false;
       setFeedback(!deleted && existing ? '原进度正在其他标签页使用，已另存。' : '原草稿已移除，已另存。');
       return true;
     }
@@ -285,14 +315,37 @@ export function usePractice(config: PracticeConfig, initialDraft: PracticeDraft 
     emitDraft(attempt, typedRef.current, force || forked);
   }, []);
 
+  function detachFromOnline(attempt: Attempt, message: string) {
+    if (storedDraft(attempt.recordId)?.completed) clearDraft(attempt, ownerToken.current);
+    releaseLease(attempt, ownerToken.current);
+    attempt.recordId = uniqueId(); attempt.revision = 0; attempt.progressVersion = 0; attempt.progressFingerprint = undefined;
+    attempt.id = undefined; attempt.recoveryId = undefined; attempt.recoveryKey = undefined;
+    attempt.claimId = undefined; attempt.claimVersion = undefined; attempt.recoveryRequestId = undefined; attempt.recoveryMarker = undefined; attempt.recoveryBaseVersion = undefined;
+    attempt.personalOnly = true; attempt.offline = true; attempt.pendingStart = false;
+    setFeedback(message);
+    if (['running', 'paused', 'pausing', 'resuming'].includes(phaseRef.current)) persist(attempt, true);
+  }
+
+  function handleRecoveryConflict(attempt: Attempt, error: unknown) {
+    if (!(error instanceof ApiError)) return false;
+    if (error.code === 'PRACTICE_TAKEN') { detachFromOnline(attempt, '进度已在其他设备继续，当前练习已另存。'); return true; }
+    if (error.code === 'DRAFT_DELETED') { detachFromOnline(attempt, '草稿已在其他设备删除，当前练习已另存。'); return true; }
+    if (error.code === 'DRAFT_MISMATCH') { detachFromOnline(attempt, '草稿状态已变化，当前练习已另存。'); return true; }
+    if (error.code === 'DRAFT_STALE') { detachFromOnline(attempt, '其他设备有更新，当前练习已另存。'); return true; }
+    if (error.code === 'SCORE_FINALIZED') { detachFromOnline(attempt, '这次成绩已提交或审核结束。'); return true; }
+    return false;
+  }
+
   const settle = (attempt: Attempt, final: PracticeResult, typed: string) => {
     const entry = recordResult(attempt, final, typed);
     const recordId = final.attemptId ?? attempt.recordId;
-    const alreadyRecorded = recorded.current.has(recordId) || localHistory().some((item) => item.recordId === recordId && item.ownerId === attempt.ownerId);
-    if (!alreadyRecorded) {
+    const previous = localHistory().find((item) => (item.recordId === recordId || item.recordId === attempt.recordId) && item.ownerId === attempt.ownerId);
+    const alreadyRecorded = recorded.current.has(recordId) || !!previous;
+    if (!alreadyRecorded || (!final.offline && previous?.localOnly)) {
       recorded.current.add(recordId);
-      rememberHistory(entry);
+      rememberHistory(entry, attempt.recordId);
       notify(liveConfig.current.onRecord, entry);
+      if (previous?.recordId && previous.recordId !== recordId) notify(liveConfig.current.onReplaceRecord, previous.recordId, attempt.ownerId);
     }
     const characters = committed();
     const offset = attempt.offset ?? 0;
@@ -300,7 +353,7 @@ export function usePractice(config: PracticeConfig, initialDraft: PracticeDraft 
     const nextOffset = continuationOffset(attempt.strict, offset, characters, expected);
     if (nextOffset < final.articleTotal) {
       const next: Attempt = {
-        ...attempt, id: undefined, recordId: nextRecordId(recordId), revision: 0, legacy: false,
+        ...attempt, id: undefined, recoveryId: undefined, recoveryKey: undefined, claimId: undefined, claimVersion: undefined, recoveryRequestId: undefined, recoveryMarker: undefined, progressVersion: 0, recoveryBaseVersion: undefined, progressFingerprint: undefined, personalOnly: true, recordId: nextRecordId(recordId), revision: 0, legacy: false,
         offline: true, elapsedMs: 0, startedAt: null, nextCheckpointMs: 5000,
         suspicious: false, backspaces: 0, offset: nextOffset, mistakes: [],
       };
@@ -317,25 +370,166 @@ export function usePractice(config: PracticeConfig, initialDraft: PracticeDraft 
         if (!existing) emitDraft(next, continuation.typed, true, continuation);
       }
     }
-    if (clearDraft(attempt, ownerToken.current) && !isDeleted(attempt)) removeWorkspaceDraft(attempt);
+    const keepResult = (final.offline && final.elapsedMs >= 1000 && recoverableId(attempt)) || (!final.offline && !final.submitted && final.eligible && final.attemptId);
+    if (keepResult) {
+      const saved = storedDraft(attempt.recordId);
+      if (!saved || !leaseTaken(saved, ownerToken.current)) {
+        saveDraft(attempt, typed, ownerToken.current, true, !!saved?.early);
+        emitDraft(attempt, typed, true);
+      }
+    }
+    if (!keepResult && clearDraft(attempt, ownerToken.current) && !isDeleted(attempt)) removeWorkspaceDraft(attempt);
     setResult(final); setCurrentPhase('finished');
   };
 
+  async function recoverOnline(attempt: Attempt, expectedPhase: 'paused' | 'pausing' | 'restoring' | 'resuming' | 'finishing' | 'finished', allowReplacement = true): Promise<RecoveryState | undefined> {
+    let id = recoverableId(attempt);
+    if (!id) return undefined;
+    attempt.claimId ??= clientChallengeId();
+    attempt.claimVersion ??= 0;
+    attempt.recoveryRequestId ??= clientChallengeId();
+    attempt.recoveryMarker ??= clientChallengeId();
+    attempt.recoveryBaseVersion ??= attempt.progressVersion ?? 0;
+    if (!attempt.claimId || !attempt.recoveryRequestId || !attempt.recoveryMarker) return undefined;
+    const recordId = attempt.recordId;
+    const current = () => isCurrent(attempt, expectedPhase) && attempt.recordId === recordId &&
+      liveConfig.current.ownerId === attempt.ownerId && (expectedPhase === 'finished' || !isDeleted(attempt));
+    const saveRequest = () => {
+      const saved = storedDraft(attempt.recordId);
+      if (expectedPhase === 'finished' && (!saved?.completed || leaseTaken(saved, ownerToken.current))) return;
+      if (saved?.completed) saveDraft(attempt, typedRef.current, ownerToken.current, true, !!saved.early);
+      else persist(attempt, true);
+    };
+    saveRequest();
+    if (!current()) return undefined;
+    const recover = (clientId: string) => api<RecoveryState>('/api/tests/recover', {
+      method: 'POST', timeoutMs: 5000, headers: { 'X-Workspace-Owner': attempt.ownerId ?? 'guest' }, body: {
+        clientId, ...(attempt.recoveryKey && { recoveryKey: attempt.recoveryKey }),
+        claimId: attempt.claimId, expectedClaimVersion: attempt.claimVersion, recoveryRequestId: attempt.recoveryRequestId,
+        expectedProgressVersion: attempt.recoveryBaseVersion, recoveryMarker: attempt.recoveryMarker,
+        ...(expectedPhase !== 'finished' && { draftId: practiceDraftId(attempt.recordId) }),
+        articleId: attempt.articleId, target: attempt.target,
+        ...(attempt.article && { articleKey: catalogSnapshotKey(attempt.article) }),
+        duration: attempt.duration, mode: attempt.mode ?? 'timed', strict: !!attempt.strict,
+        elapsedMs: Math.round(elapsedTime(attempt)),
+      },
+    });
+    try {
+      let state: RecoveryState;
+      try { state = await recover(id); }
+      catch (error) {
+        if (error instanceof ApiError && error.code === 'RECOVERY_ALREADY_USED' && Number.isSafeInteger(error.claimVersion) && error.claimVersion! > 0 && current()) {
+          attempt.claimVersion = error.claimVersion;
+          attempt.recoveryRequestId = clientChallengeId();
+          attempt.recoveryMarker = clientChallengeId();
+          if (!attempt.recoveryRequestId || !attempt.recoveryMarker) throw error;
+          saveRequest();
+          state = await recover(id);
+        } else {
+        // A guest cookie may have been lost with the original response. Do
+        // not claim another owner's record; create a separately reviewed round.
+          const replacement = allowReplacement && error instanceof ApiError && error.status === 404 ? clientChallengeId() : undefined;
+          if (!replacement || !current()) throw error;
+          id = replacement;
+          state = await recover(id);
+        }
+      }
+      if (!current()) return undefined;
+      if (state.id !== id || !['paused', 'finished', 'review'].includes(state.status) ||
+        (state.status === 'paused' && (!Number.isFinite(state.remainingMs) || !Number.isFinite(state.elapsedMs) || state.elapsedMs! < 0 || state.elapsedMs! > durationLimit(attempt))) ||
+        (state.status !== 'paused' && !state.result) || !Number.isSafeInteger(state.claimVersion) || state.claimVersion! < 1) throw new Error('练习恢复数据无效');
+      attempt.id = id; attempt.recoveryId = id; attempt.offline = false; attempt.pendingStart = false;
+      attempt.claimVersion = state.claimVersion; attempt.recoveryRequestId = undefined;
+      attempt.recoveryMarker = undefined;
+      attempt.recoveryBaseVersion = undefined;
+      if (state.result && state.typed !== undefined) {
+        if (typeof state.typed !== 'string' || !Number.isSafeInteger(state.backspaces) || state.backspaces! < 0 ||
+          !Number.isFinite(state.result.elapsedMs) || state.result.elapsedMs < 0 || state.result.elapsedMs > durationLimit(attempt)) throw new Error('成绩数据无效');
+        const confirmed = splitCharacters(state.typed);
+        const verified = scoreTyping(attempt.target, state.typed, Math.max(state.result.elapsedMs / 1000, 0.1));
+        if (confirmed.length > splitCharacters(attempt.target).length || verified.total !== state.result.score.total || verified.correct !== state.result.score.correct) throw new Error('成绩数据无效');
+        typedRef.current = state.typed; committedCharacters.current = confirmed; attempt.backspaces = state.backspaces!;
+        attempt.elapsedMs = state.result.elapsedMs; setElapsedMs(attempt.elapsedMs);
+        setTyped(state.typed); setRaw(state.typed); setBackspaces(state.backspaces!);
+      }
+      if (state.result && expectedPhase === 'finished') {
+        const saved = storedDraft(attempt.recordId);
+        if (saved?.completed && !leaseTaken(saved, ownerToken.current)) saveDraft(attempt, typedRef.current, ownerToken.current, true, !!saved.early);
+      }
+      if (state.status === 'paused' && state.elapsedMs! > attempt.elapsedMs) { attempt.elapsedMs = state.elapsedMs!; setElapsedMs(attempt.elapsedMs); }
+      setFeedback('');
+      return state;
+    } catch (error) {
+      if (current() && !handleRecoveryConflict(attempt, error)) { attempt.offline = true; setFeedback(error instanceof ApiError && error.status === 404 ? '文章或账号状态已变化，无法恢复上榜。' : '网络暂不可用，进度暂存本机。'); }
+      return undefined;
+    }
+  }
+
+  async function completeOnline(attempt: Attempt, used: number, value: string, early: boolean, expectedPhase: 'restoring' | 'finishing') {
+    let final = localResult(attempt, Math.max(used, attempt.elapsedMs), value);
+    if ((attempt.offline || expectedPhase === 'restoring') && recoverableId(attempt)) {
+      const recovered = await recoverOnline(attempt, expectedPhase);
+      if (!isCurrent(attempt, expectedPhase)) return undefined;
+      if (recovered?.result) return withServerResult(localResult(attempt, recovered.result.elapsedMs, typedRef.current), recovered.result);
+      final = localResult(attempt, Math.max(used, attempt.elapsedMs), value);
+      const saved = storedDraft(attempt.recordId);
+      if (recovered && (!saved || !leaseTaken(saved, ownerToken.current))) saveDraft(attempt, value, ownerToken.current, true, early);
+    }
+    if (!attempt.id || attempt.offline) return { ...final, offline: true };
+    const finishRequest = () => api<ServerResult>(`/api/tests/${attempt.id}/finish`, {
+      method: 'POST', headers: practiceClaim(attempt), body: { typed: value, suspicious: attempt.suspicious, backspaces: attempt.backspaces, elapsedMs: Math.round(Math.max(used, attempt.elapsedMs)), early },
+    });
+    try {
+      if (expectedPhase === 'restoring') {
+        const state = await api<{ result?: ServerResult }>(`/api/tests/${attempt.id}`, { headers: practiceClaim(attempt) });
+        if (!isCurrent(attempt, expectedPhase)) return undefined;
+        if (state.result) return withServerResult(final, state.result);
+      }
+      return withServerResult(final, await finishRequest());
+    }
+    catch (error) {
+      if (!isCurrent(attempt, expectedPhase)) return undefined;
+      if (handleRecoveryConflict(attempt, error)) return localResult(attempt, Math.max(used, attempt.elapsedMs), value);
+      attempt.offline = true;
+      const recovered = await recoverOnline(attempt, expectedPhase);
+      if (!isCurrent(attempt, expectedPhase)) return undefined;
+      if (recovered?.result) return withServerResult(localResult(attempt, recovered.result.elapsedMs, typedRef.current), recovered.result);
+      if (recovered?.status === 'paused') {
+        final = localResult(attempt, Math.max(used, attempt.elapsedMs), value);
+        const saved = storedDraft(attempt.recordId);
+        if (!saved || !leaseTaken(saved, ownerToken.current)) saveDraft(attempt, value, ownerToken.current, true, early);
+        try { return withServerResult(final, await finishRequest()); }
+        catch (error) { if (!isCurrent(attempt, expectedPhase)) return undefined; if (handleRecoveryConflict(attempt, error)) return localResult(attempt, Math.max(used, attempt.elapsedMs), value); attempt.offline = true; }
+      }
+      return { ...final, offline: true };
+    }
+  }
+
   async function pauseOnline(attempt: Attempt, expectedPhase: 'pausing' | 'restoring', force = true) {
     let fellBack = false;
-    if (attempt.id && !attempt.offline) {
+    let paused = false;
+    if (attempt.id && !attempt.offline && !(expectedPhase === 'restoring' && recoverableId(attempt))) {
       try {
-        const state = await api<{ remainingMs: number }>(`/api/tests/${attempt.id}/pause`, { method: 'POST', body: {} });
+        const state = await api<{ remainingMs: number }>(`/api/tests/${attempt.id}/pause`, { method: 'POST', headers: practiceClaim(attempt), body: {} });
         if (!Number.isFinite(state.remainingMs) || state.remainingMs <= 0) throw new Error('在线计时不可用');
-      } catch {
+        paused = true;
+      } catch (error) {
         if (!isCurrent(attempt, expectedPhase)) return false;
+        if (handleRecoveryConflict(attempt, error)) { setCurrentPhase('paused'); return true; }
         attempt.offline = true;
         fellBack = true;
-        setFeedback('在线计时已中断。');
       }
     }
+    if (!paused && recoverableId(attempt)) {
+      const recovered = await recoverOnline(attempt, expectedPhase);
+      if (!isCurrent(attempt, expectedPhase)) return false;
+      if (recovered?.result) { settle(attempt, withServerResult(localResult(attempt, attempt.elapsedMs, typedRef.current), recovered.result), typedRef.current); return true; }
+      if (recovered?.status === 'paused') { paused = true; fellBack = true; }
+    }
+    if (!paused && attempt.id) { attempt.offline = true; fellBack = true; }
     if (!isCurrent(attempt, expectedPhase)) return false;
     persist(attempt, force || fellBack); setCurrentPhase('paused');
+    if (paused && attempt.elapsedMs >= durationLimit(attempt)) void finish(false);
     return true;
   }
 
@@ -353,16 +547,8 @@ export function usePractice(config: PracticeConfig, initialDraft: PracticeDraft 
       return;
     }
     const value = saved.typed;
-    let final = localResult(attempt, attempt.elapsedMs, value);
-    if (attempt.id && !attempt.offline) {
-      try {
-        const state = await api<{ status: string; result?: ServerResult }>(`/api/tests/${attempt.id}`);
-        if (!isCurrent(attempt, 'restoring')) return;
-        const result = state.result ?? await api<ServerResult>(`/api/tests/${attempt.id}/finish`, { method: 'POST', body: { typed: value, suspicious: attempt.suspicious, backspaces: attempt.backspaces, elapsedMs: Math.round(attempt.elapsedMs), early: !!saved.early } });
-        final = withServerResult(final, result);
-      } catch { final.offline = true; }
-    }
-    if (isCurrent(attempt, 'restoring')) settle(attempt, final, value);
+    const final = !attempt.id && !recoverableId(attempt) ? localResult(attempt, attempt.elapsedMs, value) : await completeOnline(attempt, attempt.elapsedMs, value, !!saved.early, 'restoring');
+    if (final && isCurrent(attempt, 'restoring')) settle(attempt, final, typedRef.current);
   }
 
   useEffect(() => {
@@ -377,6 +563,7 @@ export function usePractice(config: PracticeConfig, initialDraft: PracticeDraft 
     attemptRef.current = attempt; continuationRef.current = null; parked.current = false;
     composing.current = false; lastBackspaceKey.current = -Infinity;
     typedRef.current = typed;
+    attempt.progressFingerprint = progressFingerprint(attempt, typed, attempt.elapsedMs);
     targetCharacters.current = null; committedCharacters.current = null;
     setTarget(attempt.target); setTyped(typed); setRaw(typed); setElapsedMs(attempt.elapsedMs); setBackspaces(attempt.backspaces);
     setFeedback(''); setResult(null); setRestored(true);
@@ -388,8 +575,13 @@ export function usePractice(config: PracticeConfig, initialDraft: PracticeDraft 
     const previous = attemptRef.current;
     if (previous && phaseRef.current === 'running' && !await park()) return;
     if (previous !== attemptRef.current || !mounted.current || (saved.ownerId ?? null) !== liveConfig.current.ownerId) return;
-    const attempt: Attempt = { ...saved, pendingStart: false, startedAt: null, nextCheckpointMs: saved.elapsedMs + 5000 };
+    const attempt: Attempt = { ...saved, pendingStart: false, recoveryBaseVersion: saved.recoveryBaseVersion ?? saved.progressVersion, startedAt: null, nextCheckpointMs: saved.elapsedMs + 5000 };
     bindAttempt(attempt, saved.typed);
+    if (isDeleted(attempt)) {
+      if (saved.completed) { attempt.offline = true; attempt.personalOnly = true; setResult(localResult(attempt, attempt.elapsedMs, saved.typed)); setCurrentPhase('finished'); }
+      else setCurrentPhase('ready');
+      return;
+    }
     if (!saved.completed) ensureOwnership(attempt);
     if (saved.completed || (attempt.id && !attempt.offline)) {
       setCurrentPhase('restoring');
@@ -418,8 +610,14 @@ export function usePractice(config: PracticeConfig, initialDraft: PracticeDraft 
         composing.current = false; setRaw(typedRef.current);
         attempt.elapsedMs = used; attempt.startedAt = null; clearTimer(); setElapsedMs(used); setCurrentPhase('paused');
         persist(attempt, true);
-        if (attempt.id && !attempt.offline && typeof navigator.sendBeacon === 'function') {
-          navigator.sendBeacon(`/api/tests/${attempt.id}/pause`, new Blob(['{}'], { type: 'application/json' }));
+        if (attempt.id && !attempt.offline) {
+          const claim = practiceClaim(attempt);
+          if (claim) {
+            void fetch(`/api/tests/${attempt.id}/pause`, { method: 'POST', credentials: 'same-origin', keepalive: true,
+              headers: { ...claim, 'Content-Type': 'application/json' }, body: '{}' }).catch(() => {});
+          } else if (typeof navigator.sendBeacon === 'function') {
+            navigator.sendBeacon(`/api/tests/${attempt.id}/pause`, new Blob(['{}'], { type: 'application/json' }));
+          }
         }
       } else if (['paused', 'pausing', 'resuming'].includes(phaseRef.current) && saved?.leaseOwner === ownerToken.current &&
         !saved.completed && saved.revision === attempt.revision) {
@@ -439,9 +637,22 @@ export function usePractice(config: PracticeConfig, initialDraft: PracticeDraft 
     };
     const initial = attemptRef.current;
     if (initial && phaseRef.current === 'paused') persist(initial, true);
+    let recoveringPaused = false;
+    const retryPaused = () => {
+      const attempt = attemptRef.current;
+      if (attempt && !parked.current && phaseRef.current === 'paused' && attempt.offline && attempt.recoveryRequestId && !recoveringPaused && document.visibilityState !== 'hidden') {
+        recoveringPaused = true;
+        void recoverOnline(attempt, 'paused').then((state) => {
+          if (!isCurrent(attempt, 'paused')) return;
+          if (state?.result) { settle(attempt, withServerResult(localResult(attempt, attempt.elapsedMs, typedRef.current), state.result), typedRef.current); return; }
+          if (state?.status === 'paused') { persist(attempt, true); if (attempt.elapsedMs >= durationLimit(attempt)) void finish(false); }
+        }).finally(() => { recoveringPaused = false; });
+      }
+    };
     const heartbeat = setInterval(() => {
       const attempt = attemptRef.current;
       if (!attempt || parked.current || !['running', 'paused', 'restoring', 'pausing', 'resuming'].includes(phaseRef.current)) return;
+      retryPaused();
       if (phaseRef.current === 'running' && isDeleted(attempt)) { persist(attempt, true); return; }
       const saved = storedDraft(attempt.recordId);
       if (saved && !saved.completed && saved.revision === attempt.revision && !leaseTaken(saved, ownerToken.current)) {
@@ -450,11 +661,12 @@ export function usePractice(config: PracticeConfig, initialDraft: PracticeDraft 
     }, 5000);
     window.addEventListener('pagehide', onPageHide);
     window.addEventListener('pageshow', onPageShow);
+    window.addEventListener('online', retryPaused);
     const onVisibilityChange = () => {
       if (liveConfig.current.autoPause && document.visibilityState === 'hidden' && phaseRef.current === 'running') void pause();
     };
     document.addEventListener('visibilitychange', onVisibilityChange);
-    return () => { mounted.current = false; window.removeEventListener('pagehide', onPageHide); window.removeEventListener('pageshow', onPageShow); document.removeEventListener('visibilitychange', onVisibilityChange); clearInterval(heartbeat); clearTimer(); if (attemptRef.current) releaseLease(attemptRef.current, ownerToken.current); };
+    return () => { mounted.current = false; window.removeEventListener('pagehide', onPageHide); window.removeEventListener('pageshow', onPageShow); window.removeEventListener('online', retryPaused); document.removeEventListener('visibilitychange', onVisibilityChange); clearInterval(heartbeat); clearTimer(); if (attemptRef.current) releaseLease(attemptRef.current, ownerToken.current); };
   }, []);
 
   const finish = useCallback(async (early = false) => {
@@ -480,14 +692,8 @@ export function usePractice(config: PracticeConfig, initialDraft: PracticeDraft 
     // Save the final online identity as well, so a reload can recover the
     // result even when the start response arrived during settlement.
     saveDraft(attempt, value, ownerToken.current, true, early);
-    let final = localResult(attempt, used, value);
-    if (attempt.id && !attempt.offline) {
-      try {
-        const saved = await api<ServerResult>(`/api/tests/${attempt.id}/finish`, { method: 'POST', body: { typed: value, suspicious: attempt.suspicious, backspaces: attempt.backspaces, elapsedMs: Math.round(used), early } });
-        final = withServerResult(final, saved);
-      } catch { final.offline = true; }
-    }
-    if (isCurrent(attempt, 'finishing')) settle(attempt, final, value);
+    const final = !attempt.id && !recoverableId(attempt) ? localResult(attempt, used, value) : await completeOnline(attempt, used, value, early, 'finishing');
+    if (final && isCurrent(attempt, 'finishing')) settle(attempt, final, typedRef.current);
   }, []);
 
   const beginClock = useCallback(() => {
@@ -500,7 +706,9 @@ export function usePractice(config: PracticeConfig, initialDraft: PracticeDraft 
       if (used >= durationLimit(attempt)) { void finish(false); return; }
       if (attempt.id && !attempt.offline && used >= attempt.nextCheckpointMs) {
         attempt.nextCheckpointMs = used + 5000;
-        void api(`/api/tests/${attempt.id}/checkpoint`, { method: 'POST', body: { typed: typedRef.current, elapsedMs: Math.round(used) } }).catch(() => {});
+        void api(`/api/tests/${attempt.id}/checkpoint`, { method: 'POST', headers: practiceClaim(attempt), body: { typed: typedRef.current, elapsedMs: Math.round(used) } }).catch((error: unknown) => {
+          if (isCurrent(attempt, 'running')) handleRecoveryConflict(attempt, error);
+        });
       }
       if (Math.floor(used / 1000) !== Math.floor(Math.max(0, used - 100) / 1000)) persist(attempt);
     }, 100);
@@ -514,9 +722,11 @@ export function usePractice(config: PracticeConfig, initialDraft: PracticeDraft 
     const request = ++startRequest.current;
     const { articleId, title, language, difficulty, duration, custom, ownerId, article, mode = 'timed', strict = false } = settings;
     const clientId = custom ? undefined : clientChallengeId();
+    const recoveryKey = clientId ? clientRecoveryKey() : undefined;
+    const claimId = clientId ? clientChallengeId() : undefined;
     const attempt: Attempt = {
       articleId, title, language, difficulty, duration, custom, ownerId, article, mode, strict,
-      text: settings.text, recordId: clientId ?? uniqueId(), revision: 0, target: settings.text, offline: true, pendingStart: !!clientId,
+      text: settings.text, recordId: clientId ?? uniqueId(), recoveryId: clientId, recoveryKey, claimId, claimVersion: claimId ? 1 : undefined, revision: 0, target: settings.text, offline: true, pendingStart: !!clientId && !!claimId,
       elapsedMs: 0, startedAt: performance.now(), suspicious: pendingSuspicious.current,
       backspaces: 0, nextCheckpointMs: 5000, offset: 0, mistakes: [],
     };
@@ -526,14 +736,14 @@ export function usePractice(config: PracticeConfig, initialDraft: PracticeDraft 
     targetCharacters.current = null; committedCharacters.current = null;
     attemptRef.current = attempt; setTarget(attempt.target); setFeedback(''); setResult(null); setRestored(false);
     setBackspaces(0); setElapsedMs(0); setCurrentPhase('running'); persist(attempt, true); beginClock();
-    if (!custom && clientId) {
+    if (!custom && clientId && claimId) {
       const current = () => mounted.current && attemptRef.current === attempt && startRequest.current === request &&
         attempt.recordId === originalRecordId && ['running', 'pausing', 'finishing'].includes(phaseRef.current);
       const promise = (async () => {
         try {
           const challenge = await api<{ id: string; target: string }>('/api/tests/start', {
             method: 'POST', timeoutMs: 3000, headers: { 'X-Workspace-Owner': ownerId ?? 'guest' }, body: {
-              articleId, duration, mode, strict, clientId,
+              articleId, duration, mode, strict, clientId, draftId: practiceDraftId(attempt.recordId), ...(recoveryKey && { recoveryKey }), ...(claimId && { claimId }),
               ...(settings.guardCatalog && article ? { articleKey: catalogSnapshotKey(article) } : {}),
             },
           });
@@ -545,7 +755,7 @@ export function usePractice(config: PracticeConfig, initialDraft: PracticeDraft 
           if (!current()) return;
           attempt.pendingStart = false;
           if (settings.guardCatalog && error instanceof ApiError && (error.status === 409 || error.status === 400)) settings.onCatalogStale?.();
-          setFeedback('在线练习不可用，已转为个人练习。');
+          setFeedback('网络暂不可用，进度暂存本机。');
           if (phaseRef.current !== 'finishing') persist(attempt, true);
         }
       })();
@@ -611,13 +821,36 @@ export function usePractice(config: PracticeConfig, initialDraft: PracticeDraft 
     if (isDeleted(attempt)) persist(attempt, true);
     else ensureOwnership(attempt);
     setCurrentPhase('resuming');
+    if (attempt.offline && recoverableId(attempt)) {
+      const recovered = await recoverOnline(attempt, 'resuming');
+      if (!isCurrent(attempt, 'resuming')) return;
+      if (recovered?.result) { settle(attempt, withServerResult(localResult(attempt, attempt.elapsedMs, typedRef.current), recovered.result), typedRef.current); return; }
+      if (recovered?.status === 'paused' && attempt.elapsedMs >= durationLimit(attempt)) {
+        setCurrentPhase('paused'); void finish(false); return;
+      }
+    }
     if (attempt.id && !attempt.offline) {
       try {
-        const state = await api<{ remainingMs: number }>(`/api/tests/${attempt.id}/resume`, { method: 'POST', body: {} });
+        const state = await api<{ remainingMs: number }>(`/api/tests/${attempt.id}/resume`, { method: 'POST', headers: practiceClaim(attempt), body: {} });
         if (!Number.isFinite(state.remainingMs) || state.remainingMs <= 0) throw new Error('在线计时不可用');
-      } catch {
+      } catch (error) {
         if (!isCurrent(attempt, 'resuming')) return;
-        attempt.offline = true; setFeedback('在线计时已中断。');
+        if (handleRecoveryConflict(attempt, error)) {
+          attempt.startedAt = performance.now(); setCurrentPhase('running'); beginClock(); return;
+        }
+        attempt.offline = true;
+        const recovered = await recoverOnline(attempt, 'resuming');
+        if (!isCurrent(attempt, 'resuming')) return;
+        if (recovered?.result) { settle(attempt, withServerResult(localResult(attempt, attempt.elapsedMs, typedRef.current), recovered.result), typedRef.current); return; }
+        if (recovered?.status === 'paused' && attempt.elapsedMs >= durationLimit(attempt)) {
+          setCurrentPhase('paused'); void finish(false); return;
+        }
+        if (recovered?.status === 'paused' && recovered.remainingMs && recovered.remainingMs > 0) {
+          try {
+            const state = await api<{ remainingMs: number }>(`/api/tests/${attempt.id}/resume`, { method: 'POST', headers: practiceClaim(attempt), body: {} });
+            if (!Number.isFinite(state.remainingMs) || state.remainingMs <= 0) throw new Error('在线计时不可用');
+          } catch (error) { if (!isCurrent(attempt, 'resuming')) return; if (!handleRecoveryConflict(attempt, error)) { attempt.offline = true; setFeedback('网络暂不可用，进度暂存本机。'); } }
+        }
       }
     }
     if (!isCurrent(attempt, 'resuming')) return;
@@ -640,30 +873,59 @@ export function usePractice(config: PracticeConfig, initialDraft: PracticeDraft 
     return true;
   }
 
+  async function retryOnline() {
+    const attempt = attemptRef.current;
+    if (!attempt || phaseRef.current !== 'finished' || !result?.offline || !recoverableId(attempt)) return;
+    const saved = storedDraft(attempt.recordId) ?? { ...attempt, version: 1 as const, typed: typedRef.current, completed: true, early: true };
+    parked.current = false;
+    setCurrentPhase('restoring');
+    await restoreAttempt(attempt, { ...saved, completed: true });
+  }
+
+  async function recoverForRanking(attemptId: string) {
+    const attempt = attemptRef.current;
+    if (!attempt || phaseRef.current !== 'finished' || !result?.eligible || attempt.id !== attemptId) return false;
+    const id = attemptId;
+    const state = await recoverOnline(attempt, 'finished', false);
+    if (!state?.result || state.id !== id || !isCurrent(attempt, 'finished')) return false;
+    return true;
+  }
+
+  function markRankSubmitted(attemptId: string) {
+    const attempt = attemptRef.current;
+    if (attempt && attempt.id === attemptId && phaseRef.current === 'finished' && clearDraft(attempt, ownerToken.current) && !isDeleted(attempt)) removeWorkspaceDraft(attempt);
+  }
+
   async function loadSaved(saved: SavedPractice, options?: { newRound?: boolean }) {
     if (saved.ownerId !== liveConfig.current.ownerId || !validDuration(saved.duration) || !saved.article.text || saved.article.text.length > maxTextLength) return;
     const previous = attemptRef.current;
     if (previous && phaseRef.current === 'running' && !await park()) return;
     if (previous !== attemptRef.current || !mounted.current || saved.ownerId !== liveConfig.current.ownerId) return;
     const stored = storedDraft(saved.recordId);
-    const local = stored?.version === 1 && stored.recordId === saved.recordId &&
-      stored.ownerId === saved.ownerId && stored.articleId === saved.article.id && stored.target === saved.article.text ? stored : null;
-    if (local?.completed && !leaseTaken(local, ownerToken.current)) {
-      await loadLegacy(local);
-      return;
-    }
-    if (local && !leaseTaken(local, ownerToken.current)) {
-      await loadLegacy(local);
-      return;
+    const local = stored?.version === 1 && stored.recordId === saved.recordId && stored.ownerId === saved.ownerId &&
+      stored.articleId === saved.article.id && stored.target === saved.article.text && stored.duration === saved.duration &&
+      (stored.mode ?? 'timed') === saved.mode && !!stored.strict === saved.strict ? stored : null;
+    const localAvailable = !!local && !leaseTaken(local, ownerToken.current);
+    if (localAvailable) {
+      const localSnapshot = savedPracticeFromLegacy(local!);
+      const comparison = compareDraftProgress(localSnapshot, saved);
+      if (comparison > 0 || (comparison === 0 && sameDraftSnapshot(localSnapshot, saved))) { await loadLegacy(local!); return; }
     }
     const expected = splitCharacters(saved.article.text);
-    const characters = boundedPrefix(splitCharacters(local?.typed ?? saved.typed), expected.length);
+    const characters = boundedPrefix(splitCharacters(local && !localAvailable ? local.typed : saved.typed), expected.length);
     const typed = characters.join('');
+    const synced = attemptFromSaved(saved, typed, localAvailable ? local!.revision : 0);
+    if ((!local || localAvailable) && !options?.newRound && recoverableId(synced)) {
+      bindAttempt(synced, typed);
+      setCurrentPhase('restoring');
+      await restoreAttempt(synced, { ...synced, version: 1, typed });
+      return;
+    }
     const fresh = options?.newRound && !stored && saved.offline && !saved.attemptId && validAttemptId(saved.recordId) &&
       saved.id === practiceDraftId(saved.recordId) && saved.elapsedMs === 0 && saved.backspaces === 0;
     const offset = continuationOffset(saved.strict, Math.min(saved.offset, characters.length), characters, expected);
     const attempt = attemptFromSaved({
-      ...saved, attemptId: undefined, recordId: fresh ? saved.recordId : uniqueId(), offline: true, offset: fresh ? saved.offset : offset, elapsedMs: 0,
+      ...saved, attemptId: undefined, recoveryId: undefined, recoveryKey: undefined, claimId: undefined, claimVersion: undefined, recoveryRequestId: undefined, recoveryMarker: undefined, progressVersion: 0, personalOnly: true, recordId: fresh ? saved.recordId : uniqueId(), offline: true, offset: fresh ? saved.offset : offset, elapsedMs: 0,
       backspaces: 0, mistakes: [], suspicious: false,
     }, typed);
     bindAttempt(attempt, typed);
@@ -766,5 +1028,7 @@ export function usePractice(config: PracticeConfig, initialDraft: PracticeDraft 
   const duration = attempt?.duration ?? config.duration;
   const offset = attempt?.offset ?? 0;
   const draftId = attempt ? practiceDraftId(attempt.recordId) : undefined;
-  return { phase, target, raw, typed, elapsedMs, backspaces, feedback, result, restored, mode, strict, duration, offset, draftId, textareaRef, start, pause, resume, reset, finish, park, loadSaved, loadLegacy, updateTyped, deletePreviousCharacter, onChange, onKeyDown, onCompositionStart, onCompositionEnd, markSuspicious };
+  const canRetryOnline = !!(result?.offline && result.elapsedMs >= 1000 && attempt && recoverableId(attempt));
+  const getClaimHeaders = () => attemptRef.current ? practiceClaim(attemptRef.current) : undefined;
+  return { phase, target, raw, typed, elapsedMs, backspaces, feedback, result, restored, mode, strict, duration, offset, draftId, textareaRef, start, pause, resume, retryOnline, recoverForRanking, markRankSubmitted, getClaimHeaders, canRetryOnline, reset, finish, park, loadSaved, loadLegacy, updateTyped, deletePreviousCharacter, onChange, onKeyDown, onCompositionStart, onCompositionEnd, markSuspicious };
 }

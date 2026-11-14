@@ -10,6 +10,9 @@ const app = await createApp({
   databasePath: join(directory, 'test.sqlite'),
   staticRoot: resolve('dist/client'),
   secureCookies: true,
+  // Each isolated browser test supplies a distinct forwarded address so the
+  // real per-address rate limits do not accumulate across unrelated tests.
+  trustProxy: true,
   codeSecret: 'ci-only-secret-not-used-outside-tests',
   adminEmail: 'admin@example.test',
   mailer: { async sendCode(email, code, purpose) { mailbox.set(`${email}:${purpose}`, code); } },

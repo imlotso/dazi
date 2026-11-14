@@ -59,6 +59,20 @@ export function isWorkspaceItem(value: unknown): value is WorkspaceItem {
 function replacesItem(previous: WorkspaceItem | undefined, incoming: WorkspaceItem, includeTies: boolean) {
   if (!previous) return true;
   if (incoming.kind === 'draft' && !!incoming.deleted !== !!previous.deleted) return !!incoming.deleted;
+  if (incoming.kind === 'draft' && !incoming.deleted && !previous.deleted && isObject(incoming.value) && isObject(previous.value)) {
+    const incomingClaim = typeof incoming.value.claimVersion === 'number' ? incoming.value.claimVersion : 0;
+    const previousClaim = typeof previous.value.claimVersion === 'number' ? previous.value.claimVersion : 0;
+    if (incomingClaim !== previousClaim) return incomingClaim > previousClaim;
+    const incomingProgress = incoming.value.progressVersion;
+    const previousProgress = previous.value.progressVersion;
+    const incomingStale = typeof incoming.value.recoveryMarker === 'string' && incoming.value.recoveryMarker !== previous.value.recoveryMarker && typeof previousProgress === 'number' &&
+      (typeof incoming.value.recoveryBaseVersion === 'number' ? incoming.value.recoveryBaseVersion : 0) < previousProgress;
+    const previousStale = typeof previous.value.recoveryMarker === 'string' && previous.value.recoveryMarker !== incoming.value.recoveryMarker && typeof incomingProgress === 'number' &&
+      (typeof previous.value.recoveryBaseVersion === 'number' ? previous.value.recoveryBaseVersion : 0) < incomingProgress;
+    if (incomingStale) return previousStale && includeTies;
+    if (previousStale) return true;
+    if (typeof incomingProgress === 'number' && typeof previousProgress === 'number' && incomingProgress !== previousProgress) return incomingProgress > previousProgress;
+  }
   return incoming.updatedAt > previous.updatedAt || (includeTies && incoming.updatedAt === previous.updatedAt);
 }
 
@@ -321,6 +335,7 @@ export function mutateWorkspaceValue<K extends WorkspaceKind>(
       if (value !== undefined) throw new DraftDeletedError(id);
       return items;
     }
+    if (old && !old.deleted && old.value === value) return items;
     const updatedAt = Math.max(estimatedServerTime(ownerId), (old?.updatedAt ?? -1) + 1);
     const item: WorkspaceItem = value === undefined
       ? { kind, id, updatedAt, deleted: true }

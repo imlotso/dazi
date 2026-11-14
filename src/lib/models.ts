@@ -25,8 +25,30 @@ export type PracticeRecord = {
 export type SavedPractice = {
   id: string; article: ArticleSnapshot; typed: string; elapsedMs: number; backspaces: number;
   duration: number; mode: PracticeMode; strict: boolean; offset: number; recordId: string;
-  attemptId?: string; offline: boolean; ownerId: string | null; savedAt: number; mistakes?: MistakeSample[]; suspicious?: boolean;
+  attemptId?: string; recoveryId?: string; recoveryKey?: string; claimId?: string; claimVersion?: number; recoveryRequestId?: string; recoveryMarker?: string; recoveryBaseVersion?: number; progressVersion?: number; personalOnly?: boolean; offline: boolean; ownerId: string | null; savedAt: number; mistakes?: MistakeSample[]; suspicious?: boolean;
 };
+export function compareDraftProgress(a: SavedPractice, b: SavedPractice) {
+  const claim = (a.claimVersion ?? 0) - (b.claimVersion ?? 0);
+  if (claim) return claim;
+  const aStale = staleDraftBase(a, b);
+  const bStale = staleDraftBase(b, a);
+  if (aStale || bStale) return aStale === bStale ? 0 : aStale ? -1 : 1;
+  if (a.progressVersion !== undefined && b.progressVersion !== undefined) {
+    return a.progressVersion - b.progressVersion;
+  }
+  return a.savedAt - b.savedAt;
+}
+export function sameDraftSnapshot(a: SavedPractice, b: SavedPractice) {
+  return a.typed === b.typed && a.elapsedMs === b.elapsedMs && a.backspaces === b.backspaces && a.offset === b.offset &&
+    a.recoveryId === b.recoveryId && a.recoveryKey === b.recoveryKey && a.claimId === b.claimId &&
+    a.claimVersion === b.claimVersion && a.recoveryRequestId === b.recoveryRequestId && a.recoveryMarker === b.recoveryMarker &&
+    a.recoveryBaseVersion === b.recoveryBaseVersion && !!a.personalOnly === !!b.personalOnly;
+}
+export function staleDraftBase(incoming: SavedPractice, previous: SavedPractice) {
+  return (incoming.claimVersion ?? 0) === (previous.claimVersion ?? 0) && !!incoming.recoveryMarker &&
+    incoming.recoveryMarker !== previous.recoveryMarker && previous.progressVersion !== undefined &&
+    (incoming.recoveryBaseVersion ?? 0) < previous.progressVersion;
+}
 export type WorkspaceValues = {
   favorite: { articleId: string };
   article: PrivateArticle;

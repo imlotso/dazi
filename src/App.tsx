@@ -22,6 +22,7 @@ import { RoomBackground } from './components/RoomBackground';
 import { AuthDialog } from './components/AuthDialog';
 import { Dialog } from './components/Dialog';
 import { DraftsView } from './components/DraftsView';
+import { EnglishSpeed } from './components/EnglishSpeed';
 import { MistakesView } from './components/MistakesView';
 import { PracticeLines } from './components/PracticeLines';
 import { RankingView } from './components/RankingView';
@@ -31,12 +32,12 @@ import { StatsView } from './components/StatsView';
 import { articles, type Difficulty, type Language } from './data/articles';
 import { continuationDraftId, discardSavedDraft, draftAwaitingStart, localHistory, practiceDraftId, readDraft, readDrafts, savedPracticeFromLegacy, usePractice, type PracticeDraft } from './hooks/usePractice';
 import { useWorkspace } from './hooks/useWorkspace';
-import { api, type User } from './lib/api';
-import { catalogSnapshotKey, type ArticleSnapshot, type PracticeRecord, type ReaderSettings, type SavedPractice } from './lib/models';
+import { api, ApiError, type User } from './lib/api';
+import { catalogSnapshotKey, compareDraftProgress, sameDraftSnapshot, staleDraftBase, type ArticleSnapshot, type PracticeRecord, type ReaderSettings, type SavedPractice } from './lib/models';
 import { readableCharacter } from './lib/practice-lines';
 import { scoreTyping, splitCharacters } from './lib/scoring';
 import { resolveTheme, themeStorageKey, type Theme } from './lib/theme';
-import { deleteWorkspaceValue, DraftDeletedError, isWorkspaceDraftDeleted, putWorkspaceValue } from './lib/workspace';
+import { deleteWorkspaceValue, DraftDeletedError, isWorkspaceDraftDeleted, mutateWorkspaceValue, putWorkspaceValue } from './lib/workspace';
 
 type View = 'practice' | 'library' | 'rankings' | 'history' | 'drafts' | 'mistakes' | 'stats';
 type PendingLoad = { legacy: PracticeDraft } | { draft: SavedPractice; newRound?: boolean };
@@ -166,6 +167,7 @@ function PracticeApp({ user, authReady, onUser, onAdministration }: { user: User
   const bootstrapped = useRef(false);
   const interacted = useRef(false);
   const navigation = useRef(false);
+  const rankRequest = useRef(0);
   const moreMenu = useRef<HTMLDivElement>(null);
   const moreButton = useRef<HTMLButtonElement>(null);
   const focusButton = useRef<HTMLButtonElement>(null);
@@ -193,8 +195,12 @@ function PracticeApp({ user, authReady, onUser, onAdministration }: { user: User
     onRecord(record) {
       if (record.recordId) void putWorkspaceValue(record.ownerId ?? null, 'record', record.recordId, record).catch(reportSaveError);
     },
+    onReplaceRecord(id, owner) {
+      void deleteWorkspaceValue(owner, 'record', id).catch(reportSaveError);
+    },
     onDraft(draft) {
-      return putWorkspaceValue(draft.ownerId, 'draft', draft.id, draft).catch((error: unknown) => {
+      return mutateWorkspaceValue(draft.ownerId, 'draft', draft.id, (previous) => previous &&
+        (staleDraftBase(draft, previous) || compareDraftProgress(previous, draft) > 0 || (compareDraftProgress(previous, draft) === 0 && !sameDraftSnapshot(previous, draft))) ? previous : draft).catch((error: unknown) => {
         if (error instanceof DraftDeletedError) throw error;
         reportSaveError();
       });
@@ -205,6 +211,8 @@ function PracticeApp({ user, authReady, onUser, onAdministration }: { user: User
     },
   }, null);
   const { phase, target, typed, result } = practice;
+  const currentResult = useRef(result);
+  currentResult.current = result;
   const locked = !['ready', 'finished'].includes(phase);
   const currentMode = phase === 'ready' ? workspace.settings.mode : practice.mode;
   const currentDuration = phase === 'ready' ? duration : practice.duration;
@@ -239,11 +247,18 @@ function PracticeApp({ user, authReady, onUser, onAdministration }: { user: User
     bootstrapped.current = true;
     const deleted = new Set(workspace.deletedDraftIds);
     const preferred = readDraft(ownerId);
-    const recoverable = (draft: PracticeDraft) => !draftAwaitingStart(draft) && (draft.completed || !deleted.has(practiceDraftId(draft.recordId)));
+    const recoverable = (draft: PracticeDraft) => !draftAwaitingStart(draft) && !deleted.has(practiceDraftId(draft.recordId));
     const legacy = preferred && recoverable(preferred) ? preferred : readDrafts(ownerId).find(recoverable);
     if (!interacted.current && phase === 'ready' && legacy) {
-      setSelection(legacyArticle(legacy));
-      setPendingLoad({ legacy });
+      const synced = workspace.drafts.find((draft) => draft.recordId === legacy.recordId && draft.article.id === legacy.articleId &&
+        draft.article.text === legacy.target && draft.duration === legacy.duration && draft.mode === (legacy.mode ?? 'timed') && draft.strict === !!legacy.strict);
+      const localSnapshot = savedPracticeFromLegacy(legacy);
+      if (synced && (compareDraftProgress(synced, localSnapshot) > 0 ||
+        (compareDraftProgress(synced, localSnapshot) === 0 && !sameDraftSnapshot(synced, localSnapshot)))) {
+        setSelection(synced.article); setPendingLoad({ draft: synced });
+      } else {
+        setSelection(legacyArticle(legacy)); setPendingLoad({ legacy });
+      }
     }
   }, [ready, ownerId, phase, workspace.cloudLoaded, workspace.deletedDraftIds]);
 
@@ -269,7 +284,7 @@ function PracticeApp({ user, authReady, onUser, onAdministration }: { user: User
   }, [minutes, minutesText, validDuration, workspace.settings.minutes]);
 
   useEffect(() => {
-    if (result) { setRankMessage(''); setRankSubmitted(false); setShowResult(true); }
+    if (result) { setRankMessage(result.submitted ? (result.status === 'review' ? '已提交，待复核。' : '已上榜。') : ''); setRankSubmitted(!!result.submitted); setShowResult(true); }
   }, [result]);
 
   useEffect(() => {
@@ -296,8 +311,12 @@ function PracticeApp({ user, authReady, onUser, onAdministration }: { user: User
     const deleted = new Set(workspace.deletedDraftIds);
     const completed: PracticeDraft[] = [];
     for (const draft of readDrafts(ownerId)) {
-      if (draftAwaitingStart(draft)) continue;
+      if (draftAwaitingStart(draft) || deleted.has(practiceDraftId(draft.recordId))) continue;
       if (draft.completed) {
+        const synced = drafts.get(draft.recordId);
+        const local = savedPracticeFromLegacy(draft);
+        if (synced && (compareDraftProgress(synced, local) > 0 ||
+          (compareDraftProgress(synced, local) === 0 && !sameDraftSnapshot(synced, local)))) continue;
         drafts.delete(draft.recordId);
         completed.push(draft);
       } else if (!drafts.has(draft.recordId) && !deleted.has(practiceDraftId(draft.recordId))) {
@@ -378,6 +397,8 @@ function PracticeApp({ user, authReady, onUser, onAdministration }: { user: User
 
   function resetPractice(article = selection, keepDraft = false) {
     interacted.current = true;
+    ++rankRequest.current;
+    setBusy(false);
     setSelection(article);
     practice.reset(article.text, { keepDraft });
     setShowResult(false);
@@ -395,6 +416,8 @@ function PracticeApp({ user, authReady, onUser, onAdministration }: { user: User
         if (phase === 'starting' || phase === 'finishing') setFeedback('练习保存中…');
         return;
       }
+      ++rankRequest.current;
+      setBusy(false);
       const pending = live.current ? action() : undefined;
       if (pending) await pending;
     } finally {
@@ -516,13 +539,25 @@ function PracticeApp({ user, authReady, onUser, onAdministration }: { user: User
 
   async function submitRank() {
     if (!result?.attemptId) return;
+    const attemptId = result.attemptId;
+    const request = ++rankRequest.current;
+    const current = () => live.current && rankRequest.current === request && currentResult.current?.attemptId === attemptId;
     setBusy(true); setRankMessage('');
     try {
-      const data = await api<{ status: string }>('/api/leaderboard', { method: 'POST', body: { attemptId: result.attemptId, nickname } });
+      const submit = () => api<{ status: string }>('/api/leaderboard', { method: 'POST', headers: practice.getClaimHeaders(), body: { attemptId, nickname } });
+      let data: { status: string };
+      try { data = await submit(); }
+      catch (error) {
+        if (!current() || !(error instanceof ApiError && (error.status === 404 || error.code === 'SCORE_EXPIRED')) || !await practice.recoverForRanking(attemptId)) throw error;
+        if (!current()) return;
+        data = await submit();
+      }
+      if (!current()) return;
       setRankMessage(data.status === 'review' ? '已提交，待复核。' : '已上榜。');
       setRankSubmitted(true);
-    } catch (problem) { setRankMessage((problem as Error).message); setRankSubmitted(false); }
-    finally { setBusy(false); }
+      practice.markRankSubmitted(attemptId);
+    } catch (problem) { if (current()) { setRankMessage((problem as Error).message); setRankSubmitted(false); } }
+    finally { if (current()) setBusy(false); }
   }
 
   const canChangeAccount = authReady && !pendingLoad && !accountBusy &&
@@ -587,7 +622,12 @@ function PracticeApp({ user, authReady, onUser, onAdministration }: { user: User
       <div className="workspace">
         {view === 'practice' && <>
           {focused ? <div className="focus-actions"><button ref={focusButton} className="outline-button feature-action-button" onClick={exitFocus}>退出专注</button></div> : filters}
-          <div className="status-row"><span><Clock size={23} /> {currentMode === 'article' ? '用时' : '剩余时间'}：<b data-testid="remaining-time">{formatTime(clockMs)}</b></span><span><Crosshair size={23} /> 准确率：{roundTyped ? `${previewScore.accuracy}%` : '—'}</span><span><Keyboard size={23} /> {language === 'zh' ? '字 / 分钟' : 'WPM'}：{roundTyped ? (language === 'zh' ? previewScore.cpm : previewScore.wpm) : '—'}</span></div>
+          <div className="status-row">
+            <span><Clock size={23} /> {currentMode === 'article' ? '用时' : '剩余时间'}：<b data-testid="remaining-time">{formatTime(clockMs)}</b></span>
+            <span><Crosshair size={23} /> 准确率：{roundTyped ? `${previewScore.accuracy}%` : '—'}</span>
+            {language === 'en' ? <EnglishSpeed score={roundTyped ? previewScore : undefined} display="live" />
+              : <span><Keyboard size={23} /> 字 / 分钟：{roundTyped ? previewScore.cpm : '—'}</span>}
+          </div>
           <div className="progress-row"><span>文章字数：<b data-testid="article-count">{targetCharacters.length}</b></span><span>已打字数：<b data-testid="typed-count">{typedCharacters.length}</b></span><span>当前错误：<b data-testid="error-count">{previewScore.total - previewScore.correct}</b></span><span>退格：<b data-testid="backspace-count">{practice.backspaces}</b></span></div>
           <section className="typing-panel" aria-label="文章练习">
             <div className="practice-heading">
@@ -657,9 +697,10 @@ function PracticeApp({ user, authReady, onUser, onAdministration }: { user: User
       </div>
     </Dialog>}
     {showResult && result && <Dialog title="练习成绩" onClose={() => setShowResult(false)}>
-      {result.offline && <p className="dialog-intro">{!result.custom && result.elapsedMs < 1000 ? (user ? '用时不足 1 秒，不参与排行' : '用时不足 1 秒，仅本机保存') : user ? '个人成绩' : '仅本机保存'}</p>}
+      {result.offline && <p className="dialog-intro">{practice.canRetryOnline ? '成绩尚未同步' : !result.custom && result.elapsedMs < 1000 ? (user ? '用时不足 1 秒，不参与排行' : '用时不足 1 秒，仅本机保存') : user ? '个人成绩' : '仅本机保存'}</p>}
       <div className="result-metrics">
-        <div><strong>{result.language === 'zh' ? result.score.cpm : result.score.wpm}</strong><span>{result.language === 'zh' ? '字 / 分钟' : 'WPM'}</span></div>
+        {result.language === 'en' ? <EnglishSpeed score={result.score} display="result" />
+          : <div><strong>{result.score.cpm}</strong><span>字 / 分钟</span></div>}
         <div><strong>{result.score.accuracy}%</strong><span>准确率</span></div>
         <div><strong>{typedCharacters.length} / {result.articleTotal}</strong><span>已打 / 文章字数</span>{practice.offset > 0 && <small>本轮 {result.score.total} 字</small>}</div>
         <div><strong>{result.errors}</strong><span>错误字数</span></div>
@@ -667,6 +708,8 @@ function PracticeApp({ user, authReady, onUser, onAdministration }: { user: User
         <div><strong>{formatTime(result.elapsedMs)}</strong><span>有效用时</span></div>
       </div>
       {mistakes.length > 0 && <details className="mistake-review"><summary>错字回看 · {mistakes.length > 30 ? `前 30 / ${mistakes.length}` : mistakes.length} 处</summary><ul>{mistakes.slice(0, 30).map((mistake) => <li key={mistake.index}><span>第 {mistake.index + 1} 字</span><span>原文 <b>{readableCharacter(mistake.expected)}</b></span><span>输入 <del>{readableCharacter(mistake.actual)}</del></span></li>)}</ul></details>}
+      {practice.canRetryOnline && <div className="rank-submit"><button className="primary-button" disabled={phase === 'restoring'} onClick={() => void practice.retryOnline()}>{phase === 'restoring' ? '正在恢复…' : '重试上榜'}</button></div>}
+      {practice.canRetryOnline && practice.feedback && <p className="form-error" role="alert">{practice.feedback}</p>}
       {!result.offline && result.eligible && !rankSubmitted && <div className="rank-submit">
         {!user && <label>上榜昵称<input value={nickname} maxLength={32} onChange={(event) => setNickname(event.target.value)} /></label>}
         <button className="primary-button" disabled={busy || (!user && !nickname.trim())} onClick={() => void submitRank()}><Trophy size={20} /> {busy ? '提交中…' : '提交到排行榜'}</button>

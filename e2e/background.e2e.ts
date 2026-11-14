@@ -1,4 +1,5 @@
-import { expect, test, type Page } from '@playwright/test';
+import { expect, test } from './fixtures';
+import type { Page } from '@playwright/test';
 import { resolve } from 'node:path';
 
 const dayPicture = resolve('public/assets/cloud-room.png');

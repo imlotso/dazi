@@ -74,6 +74,32 @@ describe('local workspace', () => {
     expect(newerWorkspaceItems([live], [tombstone])).toEqual([]);
   });
 
+  it('keeps the newer claim and progress even when an older draft has a later timestamp', () => {
+    const latest: WorkspaceItem = { kind: 'draft', id: draft.id, updatedAt: 10, value: { ...draft, typed: '甲乙', claimVersion: 2, progressVersion: 4 } };
+    const staleClaim: WorkspaceItem = { kind: 'draft', id: draft.id, updatedAt: 30, value: { ...draft, typed: '甲', claimVersion: 1, progressVersion: 50 } };
+    const staleProgress: WorkspaceItem = { kind: 'draft', id: draft.id, updatedAt: 40, value: { ...draft, typed: '甲', claimVersion: 2, progressVersion: 3 } };
+    expect(mergeWorkspaceItems([latest], [staleClaim])).toEqual([latest]);
+    expect(mergeWorkspaceItems([latest], [staleProgress])).toEqual([latest]);
+    expect(newerWorkspaceItems([staleClaim, staleProgress], [latest])).toEqual([]);
+  });
+
+  it('does not let an offline branch based on stale progress replace a newer draft', () => {
+    const latest: WorkspaceItem = { kind: 'draft', id: draft.id, updatedAt: 10, value: { ...draft, typed: '甲乙', claimVersion: 1, progressVersion: 5 } };
+    const stale: WorkspaceItem = { kind: 'draft', id: draft.id, updatedAt: 30, value: { ...draft, typed: '甲丙', claimVersion: 1, progressVersion: 7, recoveryMarker: 'a', recoveryBaseVersion: 4 } };
+    const sameBranch: WorkspaceItem = { kind: 'draft', id: draft.id, updatedAt: 10, value: { ...draft, typed: '甲', claimVersion: 1, progressVersion: 5, recoveryMarker: 'a', recoveryBaseVersion: 4 } };
+    expect(mergeWorkspaceItems([latest], [stale])).toEqual([latest]);
+    expect(mergeWorkspaceItems([stale], [latest])).toEqual([latest]);
+    expect(newerWorkspaceItems([stale], [latest])).toEqual([]);
+    expect(mergeWorkspaceItems([sameBranch], [stale])).toEqual([stale]);
+  });
+
+  it('prefers the authoritative incoming cloud snapshot when both local branches diverged', () => {
+    const local: WorkspaceItem = { kind: 'draft', id: draft.id, updatedAt: 30, value: { ...draft, typed: '甲乙X', claimVersion: 1, progressVersion: 15, recoveryMarker: 'b', recoveryBaseVersion: 11 } };
+    const cloud: WorkspaceItem = { kind: 'draft', id: draft.id, updatedAt: 20, value: { ...draft, typed: '甲乙丙', claimVersion: 1, progressVersion: 13, recoveryMarker: 'a', recoveryBaseVersion: 12 } };
+    expect(mergeWorkspaceItems([local], [cloud])).toEqual([cloud]);
+    expect(newerWorkspaceItems([local], [cloud])).toEqual([]);
+  });
+
   it('refuses to write a deleted draft ID but accepts a new draft ID', async () => {
     await deleteWorkspaceValue('alice', 'draft', draft.id);
     await expect(putWorkspaceValue('alice', 'draft', draft.id, draft)).rejects.toMatchObject({ name: 'DraftDeletedError', id: draft.id });
